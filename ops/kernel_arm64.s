@@ -1,0 +1,93 @@
+//go:build arm64 && !purego
+
+#include "textflag.h"
+
+// func kernel6x16NEON(a, b *float32, k int, out *[96]float32)
+//
+// Outer-product microkernel. Per k step it loads one 16-wide panel row
+// (V0-V3), broadcasts the 6 values of the packed a strip (V4-V7, reused) and
+// issues 24 fused multiply-adds into V8-V31, where V(8 + 4r + q) holds
+// columns 4q..4q+3 of output row r. Each of the 6 values has its own pointer
+// (R1-R6) stepping by the strip stride, so the loads' address updates do not
+// form one serial chain.
+TEXT ·kernel6x16NEON(SB), NOSPLIT, $0-32
+	MOVD a+0(FP), R1
+	ADD  $4, R1, R2
+	ADD  $8, R1, R3
+	ADD  $12, R1, R4
+	ADD  $16, R1, R5
+	ADD  $20, R1, R6
+	MOVD $24, R10 // strip stride: mr values
+	MOVD b+8(FP), R7
+	MOVD k+16(FP), R8
+	MOVD out+24(FP), R9
+
+	VEOR V8.B16, V8.B16, V8.B16
+	VEOR V9.B16, V9.B16, V9.B16
+	VEOR V10.B16, V10.B16, V10.B16
+	VEOR V11.B16, V11.B16, V11.B16
+	VEOR V12.B16, V12.B16, V12.B16
+	VEOR V13.B16, V13.B16, V13.B16
+	VEOR V14.B16, V14.B16, V14.B16
+	VEOR V15.B16, V15.B16, V15.B16
+	VEOR V16.B16, V16.B16, V16.B16
+	VEOR V17.B16, V17.B16, V17.B16
+	VEOR V18.B16, V18.B16, V18.B16
+	VEOR V19.B16, V19.B16, V19.B16
+	VEOR V20.B16, V20.B16, V20.B16
+	VEOR V21.B16, V21.B16, V21.B16
+	VEOR V22.B16, V22.B16, V22.B16
+	VEOR V23.B16, V23.B16, V23.B16
+	VEOR V24.B16, V24.B16, V24.B16
+	VEOR V25.B16, V25.B16, V25.B16
+	VEOR V26.B16, V26.B16, V26.B16
+	VEOR V27.B16, V27.B16, V27.B16
+	VEOR V28.B16, V28.B16, V28.B16
+	VEOR V29.B16, V29.B16, V29.B16
+	VEOR V30.B16, V30.B16, V30.B16
+	VEOR V31.B16, V31.B16, V31.B16
+
+loop:
+	VLD1.P 64(R7), [V0.S4, V1.S4, V2.S4, V3.S4]
+
+	VLD1R.P (R1)(R10), [V4.S4]
+	VFMLA   V0.S4, V4.S4, V8.S4
+	VFMLA   V1.S4, V4.S4, V9.S4
+	VFMLA   V2.S4, V4.S4, V10.S4
+	VFMLA   V3.S4, V4.S4, V11.S4
+	VLD1R.P (R2)(R10), [V5.S4]
+	VFMLA   V0.S4, V5.S4, V12.S4
+	VFMLA   V1.S4, V5.S4, V13.S4
+	VFMLA   V2.S4, V5.S4, V14.S4
+	VFMLA   V3.S4, V5.S4, V15.S4
+	VLD1R.P (R3)(R10), [V6.S4]
+	VFMLA   V0.S4, V6.S4, V16.S4
+	VFMLA   V1.S4, V6.S4, V17.S4
+	VFMLA   V2.S4, V6.S4, V18.S4
+	VFMLA   V3.S4, V6.S4, V19.S4
+	VLD1R.P (R4)(R10), [V7.S4]
+	VFMLA   V0.S4, V7.S4, V20.S4
+	VFMLA   V1.S4, V7.S4, V21.S4
+	VFMLA   V2.S4, V7.S4, V22.S4
+	VFMLA   V3.S4, V7.S4, V23.S4
+	VLD1R.P (R5)(R10), [V4.S4]
+	VFMLA   V0.S4, V4.S4, V24.S4
+	VFMLA   V1.S4, V4.S4, V25.S4
+	VFMLA   V2.S4, V4.S4, V26.S4
+	VFMLA   V3.S4, V4.S4, V27.S4
+	VLD1R.P (R6)(R10), [V5.S4]
+	VFMLA   V0.S4, V5.S4, V28.S4
+	VFMLA   V1.S4, V5.S4, V29.S4
+	VFMLA   V2.S4, V5.S4, V30.S4
+	VFMLA   V3.S4, V5.S4, V31.S4
+
+	SUBS $1, R8, R8
+	BNE  loop
+
+	VST1.P [V8.S4, V9.S4, V10.S4, V11.S4], 64(R9)
+	VST1.P [V12.S4, V13.S4, V14.S4, V15.S4], 64(R9)
+	VST1.P [V16.S4, V17.S4, V18.S4, V19.S4], 64(R9)
+	VST1.P [V20.S4, V21.S4, V22.S4, V23.S4], 64(R9)
+	VST1.P [V24.S4, V25.S4, V26.S4, V27.S4], 64(R9)
+	VST1.P [V28.S4, V29.S4, V30.S4, V31.S4], 64(R9)
+	RET

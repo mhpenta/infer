@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux runners are x86-64 with AVX2 (some with AVX-512); macOS
+        # runners are arm64, for the NEON kernels.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - uses: actions/cache@v4
+        with:
+          path: testdata/models
+          key: models-${{ hashFiles('scripts/fetch_models.sh') }}
+      - run: scripts/fetch_models.sh
+      - run: go vet ./...
+      - name: go test (SIMD kernels)
+        run: go test ./...
+        env:
+          # Fail rather than skip if the x86 runner lacks AVX2.
+          INFER_REQUIRE_AVX2: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: go test (portable kernels)
+        run: go test -tags purego -short ./...
+      - name: vet the benchmark module
+        run: go vet .
+        working-directory: benchcmp

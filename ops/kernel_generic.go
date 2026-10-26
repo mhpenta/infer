@@ -1,0 +1,53 @@
+//go:build (!arm64 && !amd64) || purego
+
+package ops
+
+import "fmt"
+
+// Kernel names the microkernel in use, for logs.
+func Kernel() string { return "go" }
+
+// CPUFeatures lists the vector extensions in use, for logs: none here.
+func CPUFeatures() string { return "" }
+
+// KernelCheck returns nil: there is no SIMD kernel to self-check.
+func KernelCheck() error { return nil }
+
+// UseKernel selects a kernel by name; only "go" exists in this build.
+func UseKernel(name string) error {
+	if name != "go" {
+		return fmt.Errorf("ops: kernel %q unavailable in this build (only go)", name)
+	}
+	return nil
+}
+
+// kernel6x16 is the microkernel; see the contract in kernel_go.go.
+func kernel6x16(a, b *float32, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel6x16Portable(a, b, k, c, ldc, bias, mode)
+}
+
+// peakLoop reports that the portable build has no peak-rate loop.
+func peakLoop(iters int) bool { return false }
+
+// kernel12x32 is the wide kernel; see the contract in kernel_go.go. Only
+// tests enable the wide path in this build.
+func kernel12x32(a0, a1, b0, b1 *float32, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel12x32Portable(a0, a1, b0, b1, k, c, ldc, bias, mode)
+}
+
+// peakWideLoop reports that this build has no wider vector unit to measure.
+func peakWideLoop(iters int) bool { return false }
+
+// HalfPanels reports whether fp16 panels pay off here: false, as there is no
+// SIMD kernel that widens them (the portable one converts every value).
+func HalfPanels() bool { return false }
+
+// kernel6x16Half is the fp16-panel microkernel; only tests use it here.
+func kernel6x16Half(a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel6x16PortableHalf(a, b, k, c, ldc, bias, mode)
+}
+
+// kernel12x32Half is the fp16-panel wide kernel; only tests use it here.
+func kernel12x32Half(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel12x32PortableHalf(a0, a1, b0, b1, k, c, ldc, bias, mode)
+}
