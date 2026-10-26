@@ -3,8 +3,9 @@ Generate infer's amd64 matmul microkernels.
 
     python3 scripts/gen_amd64_kernels.py
 
-Writes ops/kernel_amd64.s (6×16, AVX2) and ops/kernel12x32_amd64.s (12×32,
-AVX-512), each with a float32-panel and an fp16-panel variant. The variants
+Writes ops/kernel_amd64.s (6×16, AVX2), ops/kernel12x32_amd64.s (12×32,
+AVX-512) and ops/gemv_amd64.s (one-row products over 4 or 1 panels, AVX2),
+each with a float32-panel and an fp16-panel variant. The variants
 differ only in how a panel row is loaded: VMOVUPS for float32, VCVTPH2PS
 (widening 16 halves to float32) for fp16, and in the panel stride. See the
 microkernel contract in ops/kernel_go.go.
@@ -210,6 +211,80 @@ accumulate:
 """
 
 
+def gemv(name, panels, half):
+    """One row of a times panels consecutive 16-wide panels, panelStride
+    values apart. Like the 6×16 kernels, each output is one sequential FMA
+    chain along k, so results are bit-identical to theirs."""
+    row = 32 if half else 64
+    ptrs = ["SI", "R9", "R10", "R11"][:panels]
+    acc = lambda p, h: f"Y{2 * p + h}"
+
+    def step(boff, aoff):
+        lines = [f"\tVBROADCASTSS {aoff}(DI), Y15"]
+        for p, ptr in enumerate(ptrs):
+            if half:
+                t0, t1 = f"Y{8 + 2 * (p % 3)}", f"Y{9 + 2 * (p % 3)}"
+                lines += [f"\tVCVTPH2PS {boff}({ptr}), {t0}", f"\tVCVTPH2PS {boff + 16}({ptr}), {t1}",
+                          f"\tVFMADD231PS {t0}, Y15, {acc(p, 0)}", f"\tVFMADD231PS {t1}, Y15, {acc(p, 1)}"]
+            else:
+                lines += [f"\tVFMADD231PS {boff}({ptr}), Y15, {acc(p, 0)}", f"\tVFMADD231PS {boff + 32}({ptr}), Y15, {acc(p, 1)}"]
+        return lines
+
+    setup = []
+    if panels > 1:
+        shift = 1 if half else 2  # stride in bytes: values × 2 or 4
+        setup = [f"\tSHLQ ${shift}, R8", "\tLEAQ (SI)(R8*1), R9"]
+        if panels > 2:
+            setup.append("\tLEAQ (R9)(R8*1), R10")
+        if panels > 3:
+            setup.append("\tLEAQ (R10)(R8*1), R11")
+    adds = "\n".join(f"\tADDQ ${2 * row}, {ptr}" for ptr in ptrs)
+    adds1 = "\n".join(f"\tADDQ ${row}, {ptr}" for ptr in ptrs)
+    stores = "\n".join(f"\tVMOVUPS {acc(p, h)}, {64 * p + 32 * h}(DX)" for p in range(panels) for h in range(2))
+    zero = "\n".join(f"\tVXORPS {acc(p, h)}, {acc(p, h)}, {acc(p, h)}" for p in range(panels) for h in range(2))
+    btype = "uint16" if half else "float32"
+    return f"""
+// func {name}(a *float32, b *{btype}, panelStride int, k int, out *[{16 * panels}]float32)
+//
+// out[16p + j] = sum over kk < k of a[kk]·b[p][kk][j] for {panels} panel(s), k >= 1.
+// Per k step: broadcast a[kk] (Y15) and fused multiply-add one 16-wide row of
+// each panel into its two accumulators. The main loop takes 2 k steps.
+TEXT ·{name}(SB), NOSPLIT, $0-40
+	MOVQ a+0(FP), DI
+	MOVQ b+8(FP), SI
+	MOVQ panelStride+16(FP), R8
+	MOVQ k+24(FP), CX
+	MOVQ out+32(FP), DX
+{NL.join(setup)}
+
+{zero}
+
+	MOVQ  CX, BX
+	SHRQ  $1, BX
+	ANDQ  $1, CX
+	TESTQ BX, BX
+	JZ    tail
+
+loop2:
+{NL.join(step(0, 0))}
+{NL.join(step(row, 4))}
+{adds}
+	ADDQ $8, DI
+	DECQ BX
+	JNZ  loop2
+
+tail:
+	TESTQ CX, CX
+	JZ    done
+{NL.join(step(0, 0))}
+
+done:
+{stores}
+	VZEROUPPER
+	RET
+"""
+
+
 def write(path, text):
     with open(os.path.join(ROOT, path), "w") as f:
         f.write(text)
@@ -217,3 +292,5 @@ def write(path, text):
 
 write("ops/kernel_amd64.s", HEADER + kernel6x16("kernel6x16AVX2", False) + kernel6x16("kernel6x16AVX2H", True))
 write("ops/kernel12x32_amd64.s", HEADER + kernel12x32("kernel12x32AVX512", False) + kernel12x32("kernel12x32AVX512H", True))
+write("ops/gemv_amd64.s", HEADER + gemv("gemv4AVX2", 4, False) + gemv("gemv1AVX2", 1, False)
+      + gemv("gemv4AVX2H", 4, True) + gemv("gemv1AVX2H", 1, True))

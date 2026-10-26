@@ -53,6 +53,19 @@ type Packed struct {
 	n, k int
 	data []float32 // float32 panels, nil when half is used
 	half []uint16  // fp16 panels
+
+	// stride, when set, is the distance between panels in values; otherwise
+	// panels are dense (k·nr apart). A larger stride leaves room for k to
+	// grow in place, as a cache of attention values does.
+	stride int
+}
+
+// panelStride returns the distance between consecutive panels, in values.
+func (p *Packed) panelStride() int {
+	if p.stride > 0 {
+		return p.stride
+	}
+	return p.k * nr
 }
 
 // N returns the number of output columns.
@@ -205,6 +218,11 @@ func gemm(m int, a []float32, lda int, b *Packed, bias, c []float32, ldc int, wo
 	_ = a[(m-1)*lda+k-1]
 	_ = c[(m-1)*ldc+n-1]
 
+	if m == 1 {
+		gemv(a[:k], b, bias, c[:n], workers)
+		return
+	}
+
 	// Pack all of a up front: every column block reuses the same strips, and
 	// packing costs m·k against the product's m·n·k.
 	buf := getScratch((m + mr - 1) / mr * mr * k)
@@ -256,6 +274,58 @@ func gemmBlock(packed []float32, b *Packed, bias, c []float32, ldc, i0, i1, j0, 
 	}
 }
 
+// gemv is gemm for one row of a: c[0:n] = a[0:k]·B (plus bias). Decoding
+// runs every product this way, one token at a time, where padding the row to
+// a 6-row strip would waste five sixths of the work. It walks the same
+// kc-deep slices and sums each output in the same order as the 6×16 and
+// 12×32 kernels, so results are bit-identical to gemm's.
+func gemv(a []float32, b *Packed, bias, c []float32, workers int) {
+	n, k := b.n, b.k
+	panels := (n + nr - 1) / nr
+	stride := b.panelStride()
+	// Split the panels into chunks of 4-panel groups for the workers.
+	groups := (panels + 3) / 4
+	chunks := min(groups, max(workers, 1))
+	forEach(chunks, chunks, func(ci int) {
+		g0, g1 := ci*groups/chunks, (ci+1)*groups/chunks
+		var out [4 * nr]float32
+		for k0 := 0; k0 < k; k0 += kc {
+			depth := min(kc, k-k0)
+			mode := addC
+			if k0 == 0 {
+				mode = storeC
+				if bias != nil {
+					mode = storeBiasC
+				}
+			}
+			for p := g0 * 4; p < min(g1*4, panels); {
+				count := 4
+				if p+4 > panels {
+					count = 1
+				}
+				if b.half != nil {
+					gemvPanelsHalf(&a[k0], &b.half[p*stride+k0*nr], stride, depth, count, &out)
+				} else {
+					gemvPanels(&a[k0], &b.data[p*stride+k0*nr], stride, depth, count, &out)
+				}
+				j0 := p * nr
+				for jj, v := range out[:min(count*nr, n-j0)] {
+					j := j0 + jj
+					switch mode {
+					case storeC:
+						c[j] = v
+					case storeBiasC:
+						c[j] = v + bias[j]
+					case addC:
+						c[j] += v
+					}
+				}
+				p += count
+			}
+		}
+	})
+}
+
 // tiler runs microkernels over one kc-deep slice of a block.
 type tiler struct {
 	packed  []float32
@@ -280,12 +350,12 @@ func (t *tiler) half() bool {
 // panel returns the kc slice of b's float32 panel holding column j (a
 // multiple of nr).
 func (t *tiler) panel(j int) *float32 {
-	return &t.b.data[(j/nr)*t.b.k*nr+t.k0*nr]
+	return &t.b.data[(j/nr)*t.b.panelStride()+t.k0*nr]
 }
 
 // panelHalf is panel for fp16 panels.
 func (t *tiler) panelHalf(j int) *uint16 {
-	return &t.b.half[(j/nr)*t.b.k*nr+t.k0*nr]
+	return &t.b.half[(j/nr)*t.b.panelStride()+t.k0*nr]
 }
 
 // kernel runs the 6×16 kernel for the panel storage in use.

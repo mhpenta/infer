@@ -234,3 +234,42 @@ func peakWideLoop(iters int) bool {
 	peakAVX512(iters)
 	return true
 }
+
+// One-row kernels (gemv_amd64.s): 4 or 1 panels, float32 or fp16 panels.
+//
+//go:noescape
+func gemv4AVX2(a, b *float32, panelStride, k int, out *[4 * nr]float32)
+
+//go:noescape
+func gemv1AVX2(a, b *float32, panelStride, k int, out *[nr]float32)
+
+//go:noescape
+func gemv4AVX2H(a *float32, b *uint16, panelStride, k int, out *[4 * nr]float32)
+
+//go:noescape
+func gemv1AVX2H(a *float32, b *uint16, panelStride, k int, out *[nr]float32)
+
+// gemvPanels computes one row against panels (1 or 4) consecutive panels;
+// see gemvGo.
+func gemvPanels(a, b *float32, panelStride, k, panels int, out *[4 * nr]float32) {
+	switch {
+	case !useAVX2:
+		gemvGo(a, b, panelStride, k, panels, out[:])
+	case panels == 4:
+		gemv4AVX2(a, b, panelStride, k, out)
+	default:
+		gemv1AVX2(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
+	}
+}
+
+// gemvPanelsHalf is gemvPanels for fp16 panels.
+func gemvPanelsHalf(a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
+	switch {
+	case !useAVX2:
+		gemvGoHalf(a, b, panelStride, k, panels, out[:])
+	case panels == 4:
+		gemv4AVX2H(a, b, panelStride, k, out)
+	default:
+		gemv1AVX2H(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
+	}
+}

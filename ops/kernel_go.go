@@ -136,3 +136,39 @@ func kernel12x32PortableHalf(a0, a1 *float32, b0, b1 *uint16, k int, c *float32,
 	kernel6x16PortableHalf(a1, b0, k, down, ldc, bias, mode)
 	kernel6x16PortableHalf(a1, b1, k, downRight, ldc, bias1, mode)
 }
+
+// gemvGo computes out[16p + j], the dot product of a[0:k] with column j of
+// panel p, for panels consecutive panels starting at b (panelStride values
+// apart). It sums in the same order as kernel6x16Go.
+func gemvGo(a, b *float32, panelStride, k, panels int, out []float32) {
+	as := unsafe.Slice(a, k)
+	for p := range panels {
+		panel := unsafe.Slice((*float32)(unsafe.Add(unsafe.Pointer(b), p*panelStride*4)), k*nr)
+		var acc [nr]float32
+		for kk, av := range as {
+			bp := panel[kk*nr : kk*nr+nr : kk*nr+nr]
+			for j, bv := range bp {
+				acc[j] += av * bv
+			}
+		}
+		copy(out[p*nr:], acc[:])
+	}
+}
+
+// gemvGoHalf is gemvGo for fp16 panels.
+func gemvGoHalf(a *float32, b *uint16, panelStride, k, panels int, out []float32) {
+	as := unsafe.Slice(a, k)
+	for p := range panels {
+		panel := unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(b), p*panelStride*2)), k*nr)
+		var acc, bp [nr]float32
+		for kk, av := range as {
+			for j, h := range panel[kk*nr : kk*nr+nr] {
+				bp[j] = half.ToFloat32(h)
+			}
+			for j, bv := range bp {
+				acc[j] += av * bv
+			}
+		}
+		copy(out[p*nr:], acc[:])
+	}
+}

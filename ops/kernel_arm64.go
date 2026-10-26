@@ -70,3 +70,27 @@ func kernel6x16Half(a *float32, b *uint16, k int, c *float32, ldc int, bias *flo
 func kernel12x32Half(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
 	kernel12x32PortableHalf(a0, a1, b0, b1, k, c, ldc, bias, mode)
 }
+
+// One-row kernels (gemv_arm64.s), 4 or 1 float32 panels.
+//
+//go:noescape
+func gemv4NEON(a, b *float32, panelStride, k int, out *[4 * nr]float32)
+
+//go:noescape
+func gemv1NEON(a, b *float32, panelStride, k int, out *[nr]float32)
+
+// gemvPanels computes one row against panels (1 or 4) consecutive panels;
+// see gemvGo.
+func gemvPanels(a, b *float32, panelStride, k, panels int, out *[4 * nr]float32) {
+	if panels == 4 {
+		gemv4NEON(a, b, panelStride, k, out)
+		return
+	}
+	gemv1NEON(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
+}
+
+// gemvPanelsHalf is gemvPanels for fp16 panels, which arm64 only meets in
+// tests (HalfPanels is false here).
+func gemvPanelsHalf(a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
+	gemvGoHalf(a, b, panelStride, k, panels, out[:])
+}

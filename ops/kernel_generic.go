@@ -51,3 +51,14 @@ func kernel6x16Half(a *float32, b *uint16, k int, c *float32, ldc int, bias *flo
 func kernel12x32Half(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
 	kernel12x32PortableHalf(a0, a1, b0, b1, k, c, ldc, bias, mode)
 }
+
+// gemvPanels computes one row against panels (1 or 4) consecutive panels;
+// see gemvGo.
+func gemvPanels(a, b *float32, panelStride, k, panels int, out *[4 * nr]float32) {
+	gemvGo(a, b, panelStride, k, panels, out[:])
+}
+
+// gemvPanelsHalf is gemvPanels for fp16 panels.
+func gemvPanelsHalf(a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
+	gemvGoHalf(a, b, panelStride, k, panels, out[:])
+}

@@ -3,8 +3,9 @@
 # pinned Hugging Face revisions, and check them against known hashes. Tests
 # that need a model skip when it is missing.
 #
-#   scripts/fetch_models.sh            # both models (~760 MB)
+#   scripts/fetch_models.sh            # all models (~1 GB)
 #   scripts/fetch_models.sh minilm     # just all-MiniLM-L6-v2 (~90 MB)
+#   scripts/fetch_models.sh t5         # just t5-small (~240 MB)
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -39,4 +40,12 @@ if [ "$want" = all ] || [ "$want" = mxbai ]; then
 		'36bfa45da00eb762ef9feebe4cff315ec779efadd08da11846bef5ba5b59b8f8  model.safetensors' \
 		'07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3  vocab.txt' \
 		'0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53  tokenizer_config.json'
+fi
+
+if [ "$want" = all ] || [ "$want" = t5 ]; then
+	fetch t5-small google-t5/t5-small df1b051c49625cf57a3d0d8d3863ed4d13564fe4 \
+		'530e25060e3a8d5f7b0fcf53bfea9f3601165161f3b1914676e98d97cf07bcf1  config.json' \
+		'bd944e5f1b3ad9b70dd9d00010a517059e19265671076b8b0a4a58d9491842bc  model.safetensors' \
+		'd2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066  tokenizer.json' \
+		'd1e7146101aa96282057f374aa9c3b260fba2109e5990edb1775d6efc70ffa3c  tokenizer_config.json'
 fi
