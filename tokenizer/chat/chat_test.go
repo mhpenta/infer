@@ -25,13 +25,14 @@ type chatCase struct {
 	IDs  []int  `json:"ids"`
 }
 
-// TestMiniCPM5MatchesPython renders every golden conversation and checks the
+// TestTemplatesMatchPython renders every golden conversation and checks the
 // text, and its tokens, against transformers' apply_chat_template, for each
-// MiniCPM5 template.
-func TestMiniCPM5MatchesPython(t *testing.T) {
+// supported template.
+func TestTemplatesMatchPython(t *testing.T) {
 	for _, tc := range []struct{ envVar, model, golden, template string }{
 		{"INFER_MINICPM5_DIR", "minicpm5-1b", "minicpm5_1b_chat.json", "minicpm5"},
 		{"INFER_MINICPM5_2B_DIR", "minicpm5-2b", "minicpm5_2b_chat.json", "minicpm5-2b"},
+		{"INFER_QWEN3_DIR", "qwen3-1.7b", "qwen3_1.7b_chat.json", "qwen3"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			dir := golden.ModelDir(t, tc.envVar, tc.model)

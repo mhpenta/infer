@@ -3,6 +3,7 @@ package llama
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -100,6 +101,7 @@ func argmax64(x []float64) int {
 func TestInt8MatchesBF16(t *testing.T) {
 	m, cases, _ := loadMiniCPM(t)
 	q := int8Model(t)
+	defer func() { shared.int8 = nil; runtime.GC() }()
 	if !q.lmHead.Int8() || !q.layers[0].gateUp.Int8() || q.embed.bf16 == nil {
 		t.Fatal("int8 model does not hold int8 linear layers and bf16 embeddings")
 	}

@@ -8,6 +8,10 @@ so the Go implementation can be checked token for token and layer by layer.
 
 --chat-only writes just <out_prefix>_chat.json, for a model that shares
 another's tokenizer but has its own chat template; it loads no weights.
+--tools writes just <out_prefix>_chat_tools.json: TOOL_CHAT_CASES, chat
+cases with tool definitions, assistant tool calls and tool messages.
+
+    .venv/bin/python scripts/dump_golden_llama.py --tools testdata/models/qwen3-1.7b testdata/golden/qwen3_1.7b
 
 The model runs in float32 (bf16 checkpoints are widened exactly), with eager
 attention. Writes:
@@ -140,6 +144,102 @@ CHAT_CASES = [
     {"messages": [{"role": "user", "content": "\n  naïve 日本語 😀\n\n"}, {"role": "assistant", "content": "\n\nleading newlines"}], "options": {"add_generation_prompt": True, "enable_thinking": False}},
 ]
 
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather in a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "City name, e.g. \"Paris\""},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["city"],
+        },
+    },
+}
+STOCK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_stock_price",
+        "description": "Latest price for a ticker — in USD.\nUse uppercase tickers & <exchange> codes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+                "days": {"type": "integer", "minimum": 1, "maximum": 365, "default": 30},
+                "threshold": {"type": "number", "default": 0.00001},
+                "adjusted": {"type": "boolean", "default": True},
+                "note": {"type": ["string", "null"], "default": None},
+            },
+            "required": ["ticker"],
+        },
+    },
+}
+# Escapes and numbers as json.dumps writes them: control characters, quotes,
+# backslashes, U+2028, non-ASCII kept, and floats in Python's repr.
+EDGE_TOOL = {
+    "name": "echo",
+    "description": "Tab\there, quote \" backslash \\ control \u0001\u001f line sep \u2028 é 日本 😀 </tool_call>",
+    "parameters": {"type": "object", "properties": {}, "examples": [
+        1.5, 100.0, 1e16, 1e15, 1e-7, 0.0001, -0.0, 3.141592653589793, 0.1 + 0.2, 2.5e-10, 1e22, 123456789.0,
+        12345678901234567890, -7, 0, True, False, None, "", [], {},
+    ]},
+}
+
+TOOL_CHAT_CASES = [
+    {"tools": [WEATHER_TOOL, STOCK_TOOL], "messages": [{"role": "user", "content": "What's the weather in Paris?"}],
+     "options": {"add_generation_prompt": True}},
+    {"tools": [WEATHER_TOOL], "messages": [{"role": "user", "content": "Weather in Oslo?"}],
+     "options": {"add_generation_prompt": True, "enable_thinking": False}},
+    {"tools": [STOCK_TOOL], "messages": [
+        {"role": "system", "content": "You are a careful financial assistant."},
+        {"role": "user", "content": "Price of AAPL?"},
+    ], "options": {"add_generation_prompt": True}},
+    # A full exchange: call, response, answer, follow-up.
+    {"tools": [WEATHER_TOOL], "messages": [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris", "unit": "celsius"}}}]},
+        {"role": "tool", "content": '{"temperature": 18, "condition": "cloudy"}'},
+        {"role": "assistant", "content": "It's 18°C and cloudy in Paris."},
+        {"role": "user", "content": "And in Lyon?"},
+    ], "options": {"add_generation_prompt": True, "enable_thinking": False}},
+    # Text before two calls (string and nested arguments), reasoning, and two
+    # tool responses in a row, then the model's turn.
+    {"tools": [WEATHER_TOOL, STOCK_TOOL], "messages": [
+        {"role": "user", "content": "Compare AAPL and MSFT."},
+        {"role": "assistant", "content": "Let me look both up.", "reasoning_content": "\nTwo tickers, two calls.\n", "tool_calls": [
+            {"type": "function", "function": {"name": "get_stock_price", "arguments": '{"ticker": "AAPL"}'}},
+            {"type": "function", "function": {"name": "get_stock_price", "arguments": {
+                "ticker": "MSFT", "days": 7, "threshold": 0.5, "adjusted": False, "note": None,
+                "tags": ["tech", "large cap"], "range": {"from": "2026-01-01", "to": "2026-10-27"}, "label": "Microsoft — ü"}}},
+        ]},
+        {"role": "tool", "content": '{"price": 231.4}'},
+        {"role": "tool", "content": '{"price": 512.07}'},
+    ], "options": {"add_generation_prompt": True}},
+    # A call without the "function" wrapper; the last message is the call.
+    {"tools": [EDGE_TOOL], "messages": [
+        {"role": "user", "content": "Echo hi."},
+        {"role": "assistant", "content": "<think>\nI should call echo.\n</think>\n\n", "tool_calls": [
+            {"name": "echo", "arguments": {"text": "hi", "times": 2.0}}]},
+    ], "options": {"add_generation_prompt": False}},
+    {"tools": [EDGE_TOOL, WEATHER_TOOL], "messages": [{"role": "user", "content": "Hello"}],
+     "options": {"add_generation_prompt": True}},
+    # Tool responses before the last user query; the earlier assistant turn
+    # loses its reasoning.
+    {"tools": [WEATHER_TOOL], "messages": [
+        {"role": "user", "content": "Weather in Rome?"},
+        {"role": "assistant", "content": "<think>call it</think>", "tool_calls": [
+            {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome"}}}]},
+        {"role": "tool", "content": "sunny, 25"},
+        {"role": "assistant", "content": "Sunny and 25°C."},
+        {"role": "user", "content": "Thanks!"},
+    ], "options": {"add_generation_prompt": True}},
+]
+
 LONG_TEXT = " ".join(
     [
         "Net sales increased 8% to $94.9 billion, driven by record Services revenue and strong iPhone demand,",
@@ -152,7 +252,7 @@ LONG_TEXT = " ".join(
 # Model cases: ("raw", text) is encoded without special tokens; ("chat", messages)
 # goes through the chat template with thinking disabled.
 MODEL_CASES = [
-    ("raw", "<s>The capital of France is", 8),
+    ("raw", "The capital of France is", 8),  # after the tokenizer's BOS token, if it has one
     ("chat", [{"role": "user", "content": "What is 17 * 23? Answer with just the number."}], 16),
     ("chat", [
         {"role": "system", "content": "You are a concise financial analyst."},
@@ -192,13 +292,23 @@ def ids_of(encoded):
 
 def main():
     args = sys.argv[1:]
-    chat_only = args[:1] == ["--chat-only"]
-    if chat_only:
+    mode = args[0] if args[:1] in (["--chat-only"], ["--tools"]) else ""
+    if mode:
         args = args[1:]
     if len(args) != 2:
-        sys.exit(f"usage: python {sys.argv[0]} [--chat-only] <model_dir> <out_prefix>")
+        sys.exit(f"usage: python {sys.argv[0]} [--chat-only | --tools] <model_dir> <out_prefix>")
     model_dir, out = args
+    chat_only = mode == "--chat-only"
     tok = AutoTokenizer.from_pretrained(model_dir)
+    if mode == "--tools":
+        cases = []
+        for c in TOOL_CHAT_CASES:
+            text = tok.apply_chat_template(c["messages"], tools=c["tools"], tokenize=False, **c["options"])
+            cases.append({**c, "text": text, "ids": tok(text, add_special_tokens=False)["input_ids"]})
+        with open(f"{out}_chat_tools.json", "w") as f:
+            json.dump(cases, f, ensure_ascii=False, indent=1)
+        print(f"wrote {len(cases)} tool chat cases to {out}_chat_tools.json")
+        return
 
     def token_cases(texts):
         cases = []
@@ -239,7 +349,7 @@ def main():
     cases = []
     for i, (kind, prompt, max_new) in enumerate(MODEL_CASES):
         if kind == "raw":
-            text = prompt
+            text = (tok.bos_token or "") + prompt
         else:
             text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         input_ids = torch.tensor([tok(text, add_special_tokens=False)["input_ids"]])

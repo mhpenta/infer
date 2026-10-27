@@ -18,14 +18,29 @@ type tokenCase struct {
 	DecodedSkipSpecial string `json:"decoded_skip_special"`
 }
 
-func loadMiniCPM(t testing.TB) *Tokenizer {
+// goldenModel is a tokenizer with PyTorch goldens: its directory under
+// testdata/models (or envVar), the goldens' file prefix and the added tokens
+// it must know.
+type goldenModel struct {
+	envVar, dir, prefix string
+	special             []string
+}
+
+var goldenModels = []goldenModel{
+	{"INFER_MINICPM5_DIR", "minicpm5-1b", "minicpm5_1b", []string{"<s>", "</s>", "<|im_start|>", "<|im_end|>", "<think>"}},
+	{"INFER_QWEN3_DIR", "qwen3-1.7b", "qwen3_1.7b", []string{"<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "<tool_call>"}},
+}
+
+func (g goldenModel) load(t testing.TB) *Tokenizer {
 	t.Helper()
-	tok, err := LoadDir(golden.ModelDir(t, "INFER_MINICPM5_DIR", "minicpm5-1b"))
+	tok, err := LoadDir(golden.ModelDir(t, g.envVar, g.dir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return tok
 }
+
+func loadMiniCPM(t testing.TB) *Tokenizer { return goldenModels[0].load(t) }
 
 func checkCases(t *testing.T, tok *Tokenizer, file string) {
 	t.Helper()
@@ -50,38 +65,45 @@ func checkCases(t *testing.T, tok *Tokenizer, file string) {
 	}
 }
 
-func TestMiniCPM5MatchesPython(t *testing.T) {
-	checkCases(t, loadMiniCPM(t), "minicpm5_1b_tokens.json")
+// TestMatchesPython checks each model's edge cases and 400 seeded random
+// strings mixing scripts, Unicode spaces and digits, combining marks,
+// contractions and fragments of added tokens (see
+// scripts/dump_golden_llama.py).
+func TestMatchesPython(t *testing.T) {
+	for _, g := range goldenModels {
+		t.Run(g.dir, func(t *testing.T) {
+			tok := g.load(t)
+			t.Run("cases", func(t *testing.T) { checkCases(t, tok, g.prefix+"_tokens.json") })
+			t.Run("random", func(t *testing.T) { checkCases(t, tok, g.prefix+"_tokens_random.json") })
+		})
+	}
 }
 
-// TestMiniCPM5RandomTextMatchesPython runs 400 seeded random strings mixing
-// scripts, Unicode spaces and digits, combining marks, contractions and
-// fragments of added tokens (see scripts/dump_golden_llama.py).
-func TestMiniCPM5RandomTextMatchesPython(t *testing.T) {
-	checkCases(t, loadMiniCPM(t), "minicpm5_1b_tokens_random.json")
-}
-
-// TestMiniCPM5ChatTextMatchesPython encodes the text the chat template
+// TestChatTextMatchesPython encodes the text each model's chat template
 // rendered; the template itself is the chat package's to reproduce.
-func TestMiniCPM5ChatTextMatchesPython(t *testing.T) {
-	tok := loadMiniCPM(t)
-	var cases []struct {
-		Text string `json:"text"`
-		IDs  []int  `json:"ids"`
-	}
-	golden.JSON(t, "minicpm5_1b_chat.json", &cases)
-	for i, c := range cases {
-		if got := tok.EncodeRaw(c.Text); !slices.Equal(got, c.IDs) {
-			t.Errorf("case %d: EncodeRaw(%q)\n got %v\nwant %v", i, c.Text, got, c.IDs)
-		}
-		if got := tok.Decode(c.IDs, false); got != c.Text {
-			t.Errorf("case %d: Decode = %q, want %q", i, got, c.Text)
-		}
-	}
-	for _, special := range []string{"<s>", "</s>", "<|im_start|>", "<|im_end|>", "<think>"} {
-		if _, ok := tok.TokenID(special); !ok {
-			t.Errorf("TokenID(%q) not found", special)
-		}
+func TestChatTextMatchesPython(t *testing.T) {
+	for _, g := range goldenModels {
+		t.Run(g.dir, func(t *testing.T) {
+			tok := g.load(t)
+			var cases []struct {
+				Text string `json:"text"`
+				IDs  []int  `json:"ids"`
+			}
+			golden.JSON(t, g.prefix+"_chat.json", &cases)
+			for i, c := range cases {
+				if got := tok.EncodeRaw(c.Text); !slices.Equal(got, c.IDs) {
+					t.Errorf("case %d: EncodeRaw(%q)\n got %v\nwant %v", i, c.Text, got, c.IDs)
+				}
+				if got := tok.Decode(c.IDs, false); got != c.Text {
+					t.Errorf("case %d: Decode = %q, want %q", i, got, c.Text)
+				}
+			}
+			for _, special := range g.special {
+				if _, ok := tok.TokenID(special); !ok {
+					t.Errorf("TokenID(%q) not found", special)
+				}
+			}
+		})
 	}
 }
 
@@ -105,7 +127,27 @@ func TestSplitWords(t *testing.T) {
 		{"​", []string{"​"}}, // zero-width space is not White_Space
 	}
 	for _, tt := range tests {
-		if got := splitWords(nil, tt.in); !slices.Equal(got, tt.want) {
+		if got := splitWords(true)(nil, tt.in); !slices.Equal(got, tt.want) {
+			t.Errorf("splitWords(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestSplitWordsSingleNumbers checks Qwen's variant, \p{N} in place of
+// \p{N}+: every number character is its own piece.
+func TestSplitWordsSingleNumbers(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"$12.5", []string{"$", "1", "2", ".", "5"}},
+		{"in 2026 we", []string{"in", " ", "2", "0", "2", "6", " we"}},
+		{"٣٤½x", []string{"٣", "٤", "½", "x"}},
+		{"a1b", []string{"a", "1", "b"}},
+		{"I'm 3", []string{"I", "'m", " ", "3"}},
+	}
+	for _, tt := range tests {
+		if got := splitWords(false)(nil, tt.in); !slices.Equal(got, tt.want) {
 			t.Errorf("splitWords(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}

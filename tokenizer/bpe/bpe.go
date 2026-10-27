@@ -1,17 +1,19 @@
 // Package bpe implements byte-level BPE tokenizers (GPT-2 style, as used by
-// MiniCPM and most decoder-only models), loaded from a Hugging Face
+// MiniCPM, Qwen and most decoder-only models), loaded from a Hugging Face
 // tokenizer.json.
 //
 // It reproduces the Hugging Face fast tokenizer for single sequences:
 //
 //  1. Added tokens ("<s>", "<|im_start|>", "<think>", ...) in the input are
 //     matched first and map straight to their ids.
-//  2. Pre-tokenization: the Split patterns, each cutting every piece from the
+//  2. The normalizer, if any (Qwen's NFC), on the text between them.
+//  3. Pre-tokenization: the Split patterns, each cutting every piece from the
 //     step before (see splitPatterns), then ByteLevel, which writes each
 //     byte of a piece as one character of GPT-2's byte alphabet.
-//  3. BPE: each piece starts as one token per byte and merges pairs, lowest
+//  4. BPE: each piece starts as one token per byte and merges pairs, lowest
 //     rank first, until no merge applies.
-//  4. The post-processor template (MiniCPM prepends "<s>"), for Encode.
+//  5. The post-processor template, for Encode (MiniCPM prepends "<s>";
+//     Qwen's ByteLevel post-processor adds nothing).
 //
 // Decode maps the byte alphabet back to bytes and decodes them as UTF-8,
 // replacing invalid sequences as Rust's from_utf8_lossy does. Components
@@ -27,6 +29,8 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/mhpenta/infer/tokenizer/internal/hf"
 )
@@ -52,9 +56,10 @@ type Tokenizer struct {
 	merges  map[uint64]merge
 	byteIDs [256]int32 // the token for each single byte
 
-	added    *hf.Added
-	splits   []splitFunc
-	template hf.Template
+	added     *hf.Added
+	normalize func(string) string // nil without a normalizer
+	splits    []splitFunc
+	template  hf.Template
 
 	mu    sync.Mutex
 	cache map[string][]int
@@ -121,11 +126,12 @@ func Load(path string, config Config) (*Tokenizer, error) {
 		return nil, errors.New("bpe: byte_fallback is not supported")
 	case m.IgnoreMerges:
 		return nil, errors.New("bpe: ignore_merges is not supported")
-	case !hf.IsNull(tj.Normalizer):
-		return nil, errors.New("bpe: normalizers are not supported")
 	}
 
 	t := &Tokenizer{config: config, vocab: map[string]int{}, merges: map[uint64]merge{}, cache: map[string][]int{}}
+	if t.normalize, err = parseNormalizer(tj.Normalizer); err != nil {
+		return nil, err
+	}
 	size := 0
 	for tok, id := range m.Vocab {
 		if id < 0 {
@@ -175,13 +181,49 @@ func Load(path string, config Config) (*Tokenizer, error) {
 	if err := t.parsePreTokenizer(tj.PreTokenizer); err != nil {
 		return nil, err
 	}
-	if t.template, err = hf.ParseTemplate(tj.PostProcessor); err != nil {
+	if t.template, err = parsePostProcessor(tj.PostProcessor); err != nil {
 		return nil, fmt.Errorf("bpe: %w", err)
 	}
 	if err := parseDecoder(tj.Decoder); err != nil {
 		return nil, err
 	}
 	return t, nil
+}
+
+// parseNormalizer accepts no normalizer or NFC, Unicode canonical
+// composition (golang.org/x/text's tables, which may trail the Unicode
+// version of the tokenizers library's for characters added since).
+func parseNormalizer(raw json.RawMessage) (func(string) string, error) {
+	if hf.IsNull(raw) {
+		return nil, nil
+	}
+	var n struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return nil, fmt.Errorf("bpe: parse normalizer: %w", err)
+	}
+	if n.Type != "NFC" {
+		return nil, fmt.Errorf("bpe: normalizer %s is not supported (only NFC)", raw)
+	}
+	return norm.NFC.String, nil
+}
+
+// parsePostProcessor accepts a template, or ByteLevel, which only adjusts
+// offsets and adds no tokens.
+func parsePostProcessor(raw json.RawMessage) (hf.Template, error) {
+	var p struct {
+		Type string `json:"type"`
+	}
+	if !hf.IsNull(raw) {
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return hf.Template{}, fmt.Errorf("parse post_processor: %w", err)
+		}
+	}
+	if p.Type == "ByteLevel" {
+		return hf.Template{}, nil
+	}
+	return hf.ParseTemplate(raw)
 }
 
 // parseMerge reads a merge as a pair ["a", "b"] or, in older files, "a b".
@@ -286,7 +328,7 @@ func (t *Tokenizer) Encode(text string) []int {
 func (t *Tokenizer) EncodeRaw(text string) []int {
 	var ids []int
 	var pieces, next []string
-	for _, seg := range t.added.Split(text, nil) {
+	for _, seg := range t.added.Split(text, t.normalize) {
 		if seg.Token != nil {
 			ids = append(ids, seg.Token.ID)
 			continue

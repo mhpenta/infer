@@ -17,7 +17,8 @@ type splitFunc func(dst []string, s string) []string
 // has a hand-written scanner, keyed by its exact source.
 var splitPatterns = map[string]splitFunc{
 	`\p{N}{1,3}`: splitDigits(3),
-	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`: splitWords,
+	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`: splitWords(true),  // MiniCPM5
+	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`:  splitWords(false), // Qwen2, Qwen3
 }
 
 // splitDigits isolates runs of up to limit number characters (\p{N}), taken
@@ -52,11 +53,13 @@ func splitDigits(limit int) splitFunc {
 	}
 }
 
-// splitWords is the GPT-4-style word split (cl100k's pattern with \p{N}+):
+// splitWords returns the GPT-4-style word split: cl100k's pattern with
+// \p{N}+ when numberRuns is set, or with \p{N}, one number character per
+// piece, as Qwen's tokenizers write it:
 //
 //	(?i:'s|'t|'re|'ve|'m|'ll|'d)   contractions
 //	[^\r\n\p{L}\p{N}]?\p{L}+       a word, with one leading non-letter
-//	\p{N}+                         a number
+//	\p{N}+ or \p{N}                a number
 //	 ?[^\s\p{L}\p{N}]+[\r\n]*      punctuation, with a leading space and
 //	                               trailing newlines
 //	\s*[\r\n]+                     whitespace through the last newline
@@ -66,18 +69,20 @@ func splitDigits(limit int) splitFunc {
 //
 // Every character matches some alternative, so the pieces are exactly the
 // successive matches.
-func splitWords(dst []string, s string) []string {
-	for i := 0; i < len(s); {
-		end := wordEnd(s, i)
-		dst = append(dst, s[i:end])
-		i = end
+func splitWords(numberRuns bool) splitFunc {
+	return func(dst []string, s string) []string {
+		for i := 0; i < len(s); {
+			end := wordEnd(s, i, numberRuns)
+			dst = append(dst, s[i:end])
+			i = end
+		}
+		return dst
 	}
-	return dst
 }
 
 // wordEnd returns the end of the match at s[i:], trying the alternatives in
 // order as a backtracking regex engine does.
-func wordEnd(s string, i int) int {
+func wordEnd(s string, i int, numberRuns bool) int {
 	r0, size0 := utf8.DecodeRuneInString(s[i:])
 
 	if r0 == '\'' {
@@ -95,6 +100,9 @@ func wordEnd(s string, i int) int {
 		}
 	}
 
+	if isNumber(r0) && !numberRuns {
+		return i + size0
+	}
 	if isNumber(r0) {
 		end := i
 		for end < len(s) {

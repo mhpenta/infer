@@ -1,0 +1,619 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 17 * 23?"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   3838,
+   374,
+   220,
+   16,
+   22,
+   353,
+   220,
+   17,
+   18,
+   30,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 17 * 23?"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "text": "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   3838,
+   374,
+   220,
+   16,
+   22,
+   353,
+   220,
+   17,
+   18,
+   30,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   271,
+   151668,
+   271
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 17 * 23?"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "text": "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   3838,
+   374,
+   220,
+   16,
+   22,
+   353,
+   220,
+   17,
+   18,
+   30,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a concise financial analyst."
+   },
+   {
+    "role": "user",
+    "content": "Summarize: revenue rose 8% to $94.9B."
+   },
+   {
+    "role": "assistant",
+    "content": "Revenue grew 8% to $94.9 billion."
+   },
+   {
+    "role": "user",
+    "content": "And margins?"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "text": "<|im_start|>system\nYou are a concise financial analyst.<|im_end|>\n<|im_start|>user\nSummarize: revenue rose 8% to $94.9B.<|im_end|>\n<|im_start|>assistant\nRevenue grew 8% to $94.9 billion.<|im_end|>\n<|im_start|>user\nAnd margins?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "ids": [
+   151644,
+   8948,
+   198,
+   2610,
+   525,
+   264,
+   63594,
+   5896,
+   18237,
+   13,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   9190,
+   5612,
+   551,
+   25,
+   12957,
+   16009,
+   220,
+   23,
+   4,
+   311,
+   400,
+   24,
+   19,
+   13,
+   24,
+   33,
+   13,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   98104,
+   13938,
+   220,
+   23,
+   4,
+   311,
+   400,
+   24,
+   19,
+   13,
+   24,
+   7094,
+   13,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   3036,
+   36582,
+   30,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   271,
+   151668,
+   271
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello! How can I help?"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": false
+  },
+  "text": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello! How can I help?<|im_end|>\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   13048,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   271,
+   151668,
+   271,
+   9707,
+   0,
+   2585,
+   646,
+   358,
+   1492,
+   30,
+   151645,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nsimple sum\n</think>\n\n4"
+   },
+   {
+    "role": "user",
+    "content": "times 3?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\n\n4*3\n\n</think>\n\n\n12"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": false
+  },
+  "text": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\ntimes 3?<|im_end|>\n<|im_start|>assistant\n<think>\n4*3\n</think>\n\n12<|im_end|>\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   17,
+   10,
+   17,
+   30,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   19,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   15136,
+   220,
+   18,
+   30,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   198,
+   19,
+   9,
+   18,
+   198,
+   151668,
+   271,
+   16,
+   17,
+   151645,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "answer",
+    "reasoning_content": "\nfrom the field\n"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": false
+  },
+  "text": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nfrom the field\n</think>\n\nanswer<|im_end|>\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   80,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   198,
+   1499,
+   279,
+   2070,
+   198,
+   151668,
+   271,
+   9217,
+   151645,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "pre<think>a</think>mid<think>b</think>\nend"
+   },
+   {
+    "role": "assistant",
+    "content": "no tags at all"
+   },
+   {
+    "role": "assistant",
+    "content": "</think>only a closing tag"
+   },
+   {
+    "role": "assistant",
+    "content": "\n<think>unclosed"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "text": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\na\n</think>\n\nend<|im_end|>\n<|im_start|>assistant\nno tags at all<|im_end|>\n<|im_start|>assistant\nonly a closing tag<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<think>unclosed<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   80,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   198,
+   64,
+   198,
+   151668,
+   271,
+   408,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   2152,
+   9492,
+   518,
+   678,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   3243,
+   264,
+   15316,
+   4772,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   271,
+   151668,
+   271,
+   151667,
+   1347,
+   9259,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "first"
+   },
+   {
+    "role": "user",
+    "content": "hello"
+   },
+   {
+    "role": "system",
+    "content": "second"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>r1</think>a1"
+   },
+   {
+    "role": "user",
+    "content": "<tool_response>\n42\n</tool_response>"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>r2</think>a2"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "text": "<|im_start|>system\nfirst<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>system\nsecond<|im_end|>\n<|im_start|>assistant\n<think>\nr1\n</think>\n\na1<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nr2\n</think>\n\na2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "ids": [
+   151644,
+   8948,
+   198,
+   3896,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   14990,
+   151645,
+   198,
+   151644,
+   8948,
+   198,
+   5569,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   198,
+   81,
+   16,
+   198,
+   151668,
+   271,
+   64,
+   16,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   151665,
+   198,
+   19,
+   17,
+   198,
+   151666,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   198,
+   81,
+   17,
+   198,
+   151668,
+   271,
+   64,
+   17,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   271,
+   151668,
+   271
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "assistant",
+    "content": "<think>x</think>no user at all"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": false
+  },
+  "text": "<|im_start|>assistant\nno user at all<|im_end|>\n",
+  "ids": [
+   151644,
+   77091,
+   198,
+   2152,
+   1196,
+   518,
+   678,
+   151645,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": ""
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   872,
+   198,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "\n  naïve 日本語 😀\n\n"
+   },
+   {
+    "role": "assistant",
+    "content": "\n\nleading newlines"
+   }
+  ],
+  "options": {
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "text": "<|im_start|>user\n\n  naïve 日本語 😀\n\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nleading newlines<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "ids": [
+   151644,
+   872,
+   271,
+   220,
+   94880,
+   586,
+   75402,
+   21894,
+   102819,
+   90316,
+   271,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   271,
+   151668,
+   271,
+   20654,
+   501,
+   7969,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   151667,
+   271,
+   151668,
+   271
+  ]
+ }
+]

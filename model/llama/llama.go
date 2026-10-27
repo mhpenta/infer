@@ -1,8 +1,9 @@
-// Package llama runs decoder-only transformers of the Llama family
-// (LlamaForCausalLM checkpoints such as MiniCPM5) from Hugging Face weights:
-// RMSNorm, grouped-query attention with rotary position embeddings, a SwiGLU
-// feed-forward, and generation with a KV cache: greedy, or sampled with the
-// sample package.
+// Package llama runs decoder-only transformers of the Llama family from
+// Hugging Face weights: LlamaForCausalLM checkpoints such as MiniCPM5, and
+// Qwen3ForCausalLM, which adds an RMSNorm over each attention head's queries
+// and keys. Both use RMSNorm, grouped-query attention with rotary position
+// embeddings, a SwiGLU feed-forward, and generation with a KV cache: greedy,
+// or sampled with the sample package.
 //
 // Every product runs in float32. Weights stored as bf16 stay bf16 in memory
 // (packed with ops.PackBF16 and widened in the kernels, so results are the
@@ -43,10 +44,33 @@ type Config struct {
 	AttentionBias     bool            `json:"attention_bias"`
 	MLPBias           bool            `json:"mlp_bias"`
 	TieWordEmbeddings bool            `json:"tie_word_embeddings"`
+	UseSlidingWindow  bool            `json:"use_sliding_window"`
 	EOSTokenID        json.RawMessage `json:"eos_token_id"`
 
-	// EOS are the end tokens, from eos_token_id (one id or a list).
+	// EOS are the end tokens: generation_config.json's eos_token_id, which
+	// transformers' generate uses, or else config.json's (each one id or a
+	// list).
 	EOS []int `json:"-"`
+}
+
+// qkNorm reports whether the model normalizes each head's queries and keys
+// before RoPE (Qwen3).
+func (c Config) qkNorm() bool { return c.ModelType == "qwen3" }
+
+// parseIDs reads a token id field that holds one id or a list.
+func parseIDs(raw json.RawMessage) ([]int, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var one int
+	if err := json.Unmarshal(raw, &one); err == nil {
+		return []int{one}, nil
+	}
+	var ids []int
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return nil, fmt.Errorf("eos_token_id %s is neither an id nor a list", raw)
+	}
+	return ids, nil
 }
 
 // withDefaults fills the fields transformers' LlamaConfig defaults.
@@ -66,23 +90,19 @@ func (c Config) withDefaults() (Config, error) {
 	if c.HiddenAct == "" {
 		c.HiddenAct = "silu"
 	}
-	if len(c.EOSTokenID) > 0 && string(c.EOSTokenID) != "null" {
-		var one int
-		if err := json.Unmarshal(c.EOSTokenID, &one); err == nil {
-			c.EOS = []int{one}
-		} else if err := json.Unmarshal(c.EOSTokenID, &c.EOS); err != nil {
-			return c, fmt.Errorf("eos_token_id %s is neither an id nor a list", c.EOSTokenID)
-		}
-	}
-	return c, nil
+	var err error
+	c.EOS, err = parseIDs(c.EOSTokenID)
+	return c, err
 }
 
 // validate rejects configurations this package does not implement rather
 // than running them wrong.
 func (c Config) validate() error {
 	switch {
-	case c.ModelType != "llama":
-		return fmt.Errorf("model_type %q is not llama", c.ModelType)
+	case c.ModelType != "llama" && c.ModelType != "qwen3":
+		return fmt.Errorf("model_type %q is not llama or qwen3", c.ModelType)
+	case c.UseSlidingWindow:
+		return errors.New("sliding-window attention is not supported")
 	case c.HiddenAct != "silu":
 		return fmt.Errorf("hidden_act %q is not supported", c.HiddenAct)
 	case c.AttentionBias || c.MLPBias:
@@ -117,7 +137,8 @@ type Model struct {
 
 type layer struct {
 	attnNorm, ffNorm *tensor.Tensor
-	qkv              *ops.Packed // q, k and v projections stacked
+	qNorm, kNorm     *tensor.Tensor // per-head query and key RMSNorm weights, or nil
+	qkv              *ops.Packed    // q, k and v projections stacked
 	out              *ops.Packed
 	gateUp           *ops.Packed // gate and up projections stacked
 	down             *ops.Packed
@@ -173,6 +194,11 @@ func LoadWith(dir string, opts Options) (*Model, error) {
 	if err := config.validate(); err != nil {
 		return nil, fmt.Errorf("llama: %w", err)
 	}
+	if eos, err := generationEOS(dir); err != nil {
+		return nil, fmt.Errorf("llama: %w", err)
+	} else if eos != nil {
+		config.EOS = eos
+	}
 	files, byName, err := openWeights(dir)
 	if err != nil {
 		return nil, fmt.Errorf("llama: %w", err)
@@ -186,6 +212,25 @@ func LoadWith(dir string, opts Options) (*Model, error) {
 	}
 	m.files = files
 	return m, nil
+}
+
+// generationEOS returns generation_config.json's end tokens, or nil when
+// the file or the field is missing.
+func generationEOS(dir string) ([]int, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "generation_config.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var g struct {
+		EOSTokenID json.RawMessage `json:"eos_token_id"`
+	}
+	if err := json.Unmarshal(raw, &g); err != nil {
+		return nil, fmt.Errorf("parse generation_config.json: %w", err)
+	}
+	return parseIDs(g.EOSTokenID)
 }
 
 // openWeights opens model.safetensors, or every shard of a sharded
@@ -244,7 +289,12 @@ func newModel(c Config, byName map[string]*safetensors.File, opts Options) (*Mod
 	h, ff := c.HiddenSize, c.IntermediateSize
 	for i := range c.NumHiddenLayers {
 		p := fmt.Sprintf("model.layers.%d.", i)
+		var qNorm, kNorm *tensor.Tensor
+		if c.qkNorm() {
+			qNorm, kNorm = l.tensor(p+"self_attn.q_norm.weight", c.HeadDim), l.tensor(p+"self_attn.k_norm.weight", c.HeadDim)
+		}
 		m.layers = append(m.layers, layer{
+			qNorm: qNorm, kNorm: kNorm,
 			attnNorm: l.tensor(p+"input_layernorm.weight", h),
 			ffNorm:   l.tensor(p+"post_attention_layernorm.weight", h),
 			qkv: l.stacked(h, []string{p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"},
@@ -408,6 +458,13 @@ func (st *state) forward(ids []int, keep func(*tensor.Tensor)) *tensor.Tensor {
 		}
 		rmsNormInto(h, x, l.attnNorm, c.RMSNormEps)
 		ops.LinearInto(qkv, h, l.qkv, nil)
+		if l.qNorm != nil {
+			for r := range n {
+				row := qkv.Row(r)
+				ops.RMSNorm(tensor.FromData(row[:qDim], c.NumAttentionHeads, c.HeadDim), l.qNorm, c.RMSNormEps)
+				ops.RMSNorm(tensor.FromData(row[qDim:qDim+kvDim], c.NumKeyValueHeads, c.HeadDim), l.kNorm, c.RMSNormEps)
+			}
+		}
 		rot.Apply(qkv.Data, width, c.NumAttentionHeads)
 		rot.Apply(qkv.Data[qDim:], width, c.NumKeyValueHeads)
 		cache := st.caches[i]

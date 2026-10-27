@@ -15,6 +15,7 @@ reference outputs dumped from `transformers` (see [Testing](#testing)).
 | [t5-small](https://huggingface.co/google-t5/t5-small) (T5, 60M) and T5 fine-tunes | greedy generation with a KV cache | every encoder and decoder layer within 1.5e-6 of its range; generated tokens identical on 5 inputs up to 512 tokens |
 | [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) (Llama architecture, 1.1B, bf16) | greedy generation with a KV cache, chat template | every layer within 5.8e-6 of its range; top-64 logits within 1e-5 at every position; generated tokens identical on 4 prompts up to 2,461 tokens |
 | [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B) (same architecture, 42 layers, bf16) | the same, with its own chat template | chat template matches transformers on 12 conversations; generated tokens identical on 3 prompts (not in CI: 5 GB, `scripts/fetch_models.sh minicpm5-2b`) |
+| [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) (`Qwen3ForCausalLM`: per-head q/k RMSNorm, tied embeddings, bf16) | greedy or sampled generation, chat template, NFC tokenizer | every layer within 7.3e-6 of its range; top-64 logits within 1.2e-5 after the first position (3e-5 there, an attention sink); generated tokens identical on 4 prompts up to 2,579 tokens (not in CI: 4.1 GB, `scripts/fetch_models.sh qwen3`) |
 
 ## Packages
 
@@ -25,11 +26,11 @@ reference outputs dumped from `transformers` (see [Testing](#testing)).
 | `safetensors` | memory-mapped `.safetensors` reader (F32 zero-copy, F16/BF16 upcast) |
 | `tokenizer/wordpiece` | BERT's tokenizer, matching Hugging Face's fast `BertTokenizer` |
 | `tokenizer/unigram` | SentencePiece Unigram from `tokenizer.json` (T5), including the precompiled NFKC character map |
-| `tokenizer/bpe` | byte-level BPE from `tokenizer.json` (MiniCPM5 and other GPT-2-style tokenizers), with the GPT-4-style split pattern as a hand-written scanner |
-| `tokenizer/chat` | chat templates in Go, recognized by the hash of the model's Jinja template (MiniCPM5-1B and -2B so far) |
+| `tokenizer/bpe` | byte-level BPE from `tokenizer.json` (MiniCPM5, Qwen3 and other GPT-2-style tokenizers): NFC normalization, the GPT-4-style split patterns as hand-written scanners |
+| `tokenizer/chat` | chat templates in Go, recognized by the hash of the model's Jinja template (MiniCPM5-1B and -2B, Qwen3), with Qwen3 tool calling: tool definitions, tool calls and responses, and parsing calls from a reply |
 | `model/bert` | the BERT encoder |
 | `model/t5` | the T5 encoder-decoder: relative position bias, cross-attention, greedy decoding with a KV cache |
-| `model/llama` | Llama-family decoders (`LlamaForCausalLM`): grouped-query attention, rotary embeddings, SwiGLU, bf16 or int8 weights (`llama.LoadWith(dir, llama.Options{Int8: true})`), greedy or sampled decoding with a KV cache |
+| `model/llama` | Llama-family decoders (`LlamaForCausalLM`, `Qwen3ForCausalLM`): grouped-query attention, rotary embeddings, SwiGLU, bf16 or int8 weights (`llama.LoadWith(dir, llama.Options{Int8: true})`), greedy or sampled decoding with a KV cache |
 | `sample` | choosing the next token: greedy, or temperature, top-k, top-p and repetition penalty with transformers' meaning and order, defaults read from `generation_config.json`; the distributions match transformers' logits processors |
 | `pool` | mean and CLS pooling, L2 normalization |
 | `quant` | sentence-transformers' binary quantization |
