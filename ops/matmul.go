@@ -40,6 +40,10 @@ const (
 	storeBiasC = 1 // c = sums + bias (bias holds nr values)
 	addC       = 2 // c += sums
 
+	// gemvChunksPerWorker is how many pieces a one-row product is cut into
+	// per worker, for balancing cores of different speeds.
+	gemvChunksPerWorker = 4
+
 	// macsPerWorker is the work (multiply-adds) that justifies waking one
 	// more thread. Waking a parked thread costs microseconds, which dominates
 	// the many small products of a short sequence.
@@ -419,25 +423,30 @@ func gemv(a []float32, b *Packed, bias, c []float32, workers int) {
 	n, k := b.n, b.k
 	panels := (n + nr - 1) / nr
 	stride := b.panelStride()
-	// Split the panels into chunks of 4-panel groups for the workers.
+	// Split the panels into chunks of 4-panel groups, several per worker:
+	// workers claim chunks as they go, so fast cores take more than slow
+	// ones (Apple's efficiency cores run these at about half speed).
 	groups := (panels + 3) / 4
-	chunks := min(groups, max(workers, 1))
-	forEach(chunks, chunks, func(ci int) {
+	chunks := min(groups, max(workers, 1)*gemvChunksPerWorker)
+	forEach(chunks, workers, func(ci int) {
 		g0, g1 := ci*groups/chunks, (ci+1)*groups/chunks
 		var out [4 * nr]float32
-		for k0 := 0; k0 < k; k0 += kc {
-			depth := min(kc, k-k0)
-			mode := addC
-			if k0 == 0 {
-				mode = storeC
-				if bias != nil && b.quant == nil {
-					mode = storeBiasC
-				}
+		// Each group of panels is read start to finish, one kc-deep slice
+		// after another, so the weights stream sequentially; every output
+		// still sums its slices in the same order.
+		for p := g0 * 4; p < min(g1*4, panels); {
+			count := 4
+			if p+4 > panels {
+				count = 1
 			}
-			for p := g0 * 4; p < min(g1*4, panels); {
-				count := 4
-				if p+4 > panels {
-					count = 1
+			for k0 := 0; k0 < k; k0 += kc {
+				depth := min(kc, k-k0)
+				mode := addC
+				if k0 == 0 {
+					mode = storeC
+					if bias != nil && b.quant == nil {
+						mode = storeBiasC
+					}
 				}
 				switch {
 				case b.quant != nil:
@@ -459,8 +468,8 @@ func gemv(a []float32, b *Packed, bias, c []float32, workers int) {
 						c[j] += v
 					}
 				}
-				p += count
 			}
+			p += count
 		}
 		if b.quant != nil {
 			scaleColumns(c, 0, 0, 1, g0*4*nr, min(g1*4*nr, n), b.scale, bias)

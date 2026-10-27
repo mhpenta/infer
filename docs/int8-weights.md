@@ -110,6 +110,12 @@ zero-extending load plus shift, for half the bytes. So it should approach the
 bandwidth ratio. This is not measured: Rosetta has no meaningful AVX timing,
 so it needs a real x86 host.
 
+**After the decode profile:** the change to `gemv` sped bf16 up more than
+int8 (1.24× against 1.19× on MiniCPM5-1B), since bf16 was bound by memory
+and int8 by instructions. int8 now decodes only about 1.08× faster than bf16
+there: 20.6 against 22.2 ms per token. The int8 one-row kernel streams 64 GB/s
+of int8 from DRAM, and bf16 96 GB/s of bf16.
+
 ## Next: int8 activations with integer dot products
 
 The fast path on ARM, and the one llama.cpp uses for its Q8_0 format,

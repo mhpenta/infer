@@ -231,6 +231,38 @@ against PyTorch 2.14.1 with the same thread count:
   (Accelerate); that is the gap the Accelerate and Metal spikes in
   `benchcmp/` would close.
 
+### 7. Decode profile
+
+A decoding step was profiled op by op (MiniCPM5-1B, M2 Max). The five
+matrix products take 96% of it, and attention, norms, RoPE and sampling the
+rest. The products were the place to look.
+
+- **Where the time went:** the products streamed weights at only 50–70 GB/s.
+  - The kernels measured alone looked faster (92–121 GB/s), but that
+    benchmark reused one matrix small enough for the 48 MB system cache.
+  - Cycling through 1 GB of distinct weights, the bf16 kernel ran at 66 GB/s,
+    against about 115 GB/s for plain reads on all cores.
+- **The fix**, keeping every result bit-identical:
+  - `gemv` reads each four-panel group start to finish, so the weights stream
+    sequentially. It used to visit every panel of its chunk per 256-deep slice.
+  - It cuts the work into four chunks per thread, claimed as threads free up,
+    instead of one fixed chunk each, which the efficiency cores held back.
+  - Together: 96 GB/s from DRAM.
+- **Tried and removed:** a persistent worker pool that spins between jobs.
+  Starting goroutines per product looked expensive in the CPU profile
+  (`pthread_cond_wait`), but measured within one process the pool gained at
+  most 3%, and longer spins were slower.
+
+Measured old against new in the same process, best of 6:
+
+| | before | after |
+|---|---|---|
+| MiniCPM5-1B bf16 | 27.5 ms/token | 22.2 ms/token (45 tokens/s), 1.24× |
+| MiniCPM5-1B int8 | 24.5 ms/token | 20.6 ms/token (49 tokens/s), 1.19× |
+| Qwen3-1.7B bf16 | 50.1 ms/token | 39.2 ms/token (25.5 tokens/s), 1.28× |
+
+`BenchmarkDecode` in `model/llama` times decoding steps for each model.
+
 ## After MiniCPM5
 
 - MiniCPM5-2B: loads unchanged; its 82 greedy tokens on three of the 1B
