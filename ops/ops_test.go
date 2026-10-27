@@ -2,6 +2,7 @@ package ops
 
 import (
 	"math"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mhpenta/infer/tensor"
@@ -109,4 +110,35 @@ func TestGather(t *testing.T) {
 	table := tensor.FromData([]float32{0, 1, 10, 11, 20, 21}, 3, 2)
 	out := Gather(table, []int{2, 0, 2})
 	nearAll(t, out.Data, []float32{20, 21, 0, 1, 20, 21})
+}
+
+func TestSwiGLUMatchesReference(t *testing.T) {
+	r := rand.New(rand.NewPCG(81, 82))
+	const rows, ff = 3, 37
+	gu := tensor.FromData(randomSlice(r, rows*2*ff), rows, 2*ff)
+	for i := range gu.Data {
+		gu.Data[i] *= 6 // reach saturated parts of the sigmoid
+	}
+	out := tensor.New(rows, ff)
+	SwiGLUInto(out, gu)
+	for i := range rows {
+		for j := range ff {
+			g, u := float64(gu.Data[i*2*ff+j]), float64(gu.Data[i*2*ff+ff+j])
+			want := g / (1 + math.Exp(-g)) * u
+			if got := float64(out.Data[i*ff+j]); math.Abs(got-want) > 2e-6*(1+math.Abs(want)) {
+				t.Fatalf("out[%d][%d] = %g, want %g", i, j, got, want)
+			}
+		}
+	}
+}
+
+func TestSiLUEdges(t *testing.T) {
+	x := []float32{0, 1, -1, 100, -100, float32(math.Inf(1)), float32(math.Inf(-1))}
+	SiLU(x)
+	want := []float32{0, 0.7310586, -0.26894143, 100, 0, float32(math.Inf(1)), 0}
+	for i := range x {
+		if math.Abs(float64(x[i]-want[i])) > 1e-6 && x[i] != want[i] {
+			t.Errorf("SiLU: x[%d] = %g, want %g", i, x[i], want[i])
+		}
+	}
 }

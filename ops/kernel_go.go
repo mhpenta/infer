@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"math"
 	"unsafe"
 
 	"github.com/mhpenta/infer/internal/half"
@@ -90,19 +91,31 @@ func kernel12x32Portable(a0, a1, b0, b1 *float32, k int, c *float32, ldc int, bi
 	kernel6x16Portable(a1, b1, k, downRight, ldc, bias1, mode)
 }
 
-// The fp16-panel contracts are the same with b (and b0, b1) pointing at fp16
-// panels (*uint16); each value is widened to float32 before use.
+// The narrow-panel contracts are the same with b (and b0, b1) pointing at
+// 16-bit panels (*uint16) in format f; each value is widened to float32
+// before use.
 
-// kernel6x16GoHalf is kernel6x16Go for an fp16 panel.
-func kernel6x16GoHalf(a *float32, b *uint16, k int, out *[mr * nr]float32) {
+// widenRow converts one panel row of 16-bit values to float32.
+func widenRow(f panelFormat, dst *[nr]float32, src []uint16) {
+	if f == formatBF16 {
+		for j, h := range src[:nr] {
+			dst[j] = math.Float32frombits(uint32(h) << 16)
+		}
+		return
+	}
+	for j, h := range src[:nr] {
+		dst[j] = half.ToFloat32(h)
+	}
+}
+
+// kernel6x16GoNarrow is kernel6x16Go for a 16-bit panel.
+func kernel6x16GoNarrow(f panelFormat, a *float32, b *uint16, k int, out *[mr * nr]float32) {
 	strip := unsafe.Slice(a, k*mr)
 	panel := unsafe.Slice(b, k*nr)
 	var acc [mr * nr]float32
 	var bp [nr]float32
 	for p := range k {
-		for j, h := range panel[p*nr : p*nr+nr] {
-			bp[j] = half.ToFloat32(h)
-		}
+		widenRow(f, &bp, panel[p*nr:])
 		ap := strip[p*mr : p*mr+mr : p*mr+mr]
 		for r, av := range ap {
 			ar := acc[r*nr : r*nr+nr : r*nr+nr]
@@ -114,16 +127,16 @@ func kernel6x16GoHalf(a *float32, b *uint16, k int, out *[mr * nr]float32) {
 	*out = acc
 }
 
-// kernel6x16PortableHalf is the fp16-panel microkernel contract in Go.
-func kernel6x16PortableHalf(a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+// kernel6x16PortableNarrow is the narrow-panel microkernel contract in Go.
+func kernel6x16PortableNarrow(f panelFormat, a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
 	var out [mr * nr]float32
-	kernel6x16GoHalf(a, b, k, &out)
+	kernel6x16GoNarrow(f, a, b, k, &out)
 	epilogueGo(&out, c, ldc, bias, mode)
 }
 
-// kernel12x32PortableHalf is the fp16-panel wide contract as four 6×16
+// kernel12x32PortableNarrow is the narrow-panel wide contract as four 6×16
 // portable kernels.
-func kernel12x32PortableHalf(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+func kernel12x32PortableNarrow(f panelFormat, a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
 	bias1 := bias
 	if bias != nil {
 		bias1 = (*float32)(unsafe.Add(unsafe.Pointer(bias), nr*4))
@@ -131,10 +144,10 @@ func kernel12x32PortableHalf(a0, a1 *float32, b0, b1 *uint16, k int, c *float32,
 	right := (*float32)(unsafe.Add(unsafe.Pointer(c), nr*4))
 	down := (*float32)(unsafe.Add(unsafe.Pointer(c), mr*ldc*4))
 	downRight := (*float32)(unsafe.Add(unsafe.Pointer(down), nr*4))
-	kernel6x16PortableHalf(a0, b0, k, c, ldc, bias, mode)
-	kernel6x16PortableHalf(a0, b1, k, right, ldc, bias1, mode)
-	kernel6x16PortableHalf(a1, b0, k, down, ldc, bias, mode)
-	kernel6x16PortableHalf(a1, b1, k, downRight, ldc, bias1, mode)
+	kernel6x16PortableNarrow(f, a0, b0, k, c, ldc, bias, mode)
+	kernel6x16PortableNarrow(f, a0, b1, k, right, ldc, bias1, mode)
+	kernel6x16PortableNarrow(f, a1, b0, k, down, ldc, bias, mode)
+	kernel6x16PortableNarrow(f, a1, b1, k, downRight, ldc, bias1, mode)
 }
 
 // gemvGo computes out[16p + j], the dot product of a[0:k] with column j of
@@ -155,18 +168,80 @@ func gemvGo(a, b *float32, panelStride, k, panels int, out []float32) {
 	}
 }
 
-// gemvGoHalf is gemvGo for fp16 panels.
-func gemvGoHalf(a *float32, b *uint16, panelStride, k, panels int, out []float32) {
+// gemvGoNarrow is gemvGo for 16-bit panels in format f.
+func gemvGoNarrow(f panelFormat, a *float32, b *uint16, panelStride, k, panels int, out []float32) {
 	as := unsafe.Slice(a, k)
 	for p := range panels {
 		panel := unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(b), p*panelStride*2)), k*nr)
 		var acc, bp [nr]float32
 		for kk, av := range as {
-			for j, h := range panel[kk*nr : kk*nr+nr] {
-				bp[j] = half.ToFloat32(h)
-			}
+			widenRow(f, &bp, panel[kk*nr:])
 			for j, bv := range bp {
 				acc[j] += av * bv
+			}
+		}
+		copy(out[p*nr:], acc[:])
+	}
+}
+
+// The int8-panel contracts are the same with b (and b0, b1) pointing at int8
+// panels; each value is converted to float32 (exactly) before use, so the
+// sums are those of float32 panels holding the integers. Scaling is left to
+// the caller (see PackInt8).
+
+// kernel6x16GoInt8 is kernel6x16Go for an int8 panel.
+func kernel6x16GoInt8(a *float32, b *int8, k int, out *[mr * nr]float32) {
+	strip := unsafe.Slice(a, k*mr)
+	panel := unsafe.Slice(b, k*nr)
+	var acc [mr * nr]float32
+	var bp [nr]float32
+	for p := range k {
+		for j, q := range panel[p*nr : p*nr+nr] {
+			bp[j] = float32(q)
+		}
+		ap := strip[p*mr : p*mr+mr : p*mr+mr]
+		for r, av := range ap {
+			ar := acc[r*nr : r*nr+nr : r*nr+nr]
+			for j, bv := range bp {
+				ar[j] += av * bv
+			}
+		}
+	}
+	*out = acc
+}
+
+// kernel6x16PortableInt8 is the int8-panel microkernel contract in Go.
+func kernel6x16PortableInt8(a *float32, b *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	var out [mr * nr]float32
+	kernel6x16GoInt8(a, b, k, &out)
+	epilogueGo(&out, c, ldc, bias, mode)
+}
+
+// kernel12x32PortableInt8 is the int8-panel wide contract as four 6×16
+// portable kernels.
+func kernel12x32PortableInt8(a0, a1 *float32, b0, b1 *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	bias1 := bias
+	if bias != nil {
+		bias1 = (*float32)(unsafe.Add(unsafe.Pointer(bias), nr*4))
+	}
+	right := (*float32)(unsafe.Add(unsafe.Pointer(c), nr*4))
+	down := (*float32)(unsafe.Add(unsafe.Pointer(c), mr*ldc*4))
+	downRight := (*float32)(unsafe.Add(unsafe.Pointer(down), nr*4))
+	kernel6x16PortableInt8(a0, b0, k, c, ldc, bias, mode)
+	kernel6x16PortableInt8(a0, b1, k, right, ldc, bias1, mode)
+	kernel6x16PortableInt8(a1, b0, k, down, ldc, bias, mode)
+	kernel6x16PortableInt8(a1, b1, k, downRight, ldc, bias1, mode)
+}
+
+// gemvGoInt8 is gemvGo for int8 panels.
+func gemvGoInt8(a *float32, b *int8, panelStride, k, panels int, out []float32) {
+	as := unsafe.Slice(a, k)
+	for p := range panels {
+		panel := unsafe.Slice((*int8)(unsafe.Add(unsafe.Pointer(b), p*panelStride)), k*nr)
+		var acc [nr]float32
+		for kk, av := range as {
+			for j, q := range panel[kk*nr : kk*nr+nr] {
+				acc[j] += av * float32(q)
 			}
 		}
 		copy(out[p*nr:], acc[:])

@@ -42,14 +42,18 @@ func peakWideLoop(iters int) bool { return false }
 // SIMD kernel that widens them (the portable one converts every value).
 func HalfPanels() bool { return false }
 
-// kernel6x16Half is the fp16-panel microkernel; only tests use it here.
-func kernel6x16Half(a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
-	kernel6x16PortableHalf(a, b, k, c, ldc, bias, mode)
+// BF16Panels reports whether bf16 panels run at SIMD speed here: false, as
+// the portable kernel converts every value.
+func BF16Panels() bool { return false }
+
+// kernel6x16Narrow is the 16-bit-panel microkernel; see kernel_go.go.
+func kernel6x16Narrow(f panelFormat, a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel6x16PortableNarrow(f, a, b, k, c, ldc, bias, mode)
 }
 
-// kernel12x32Half is the fp16-panel wide kernel; only tests use it here.
-func kernel12x32Half(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
-	kernel12x32PortableHalf(a0, a1, b0, b1, k, c, ldc, bias, mode)
+// kernel12x32Narrow is the 16-bit-panel wide kernel; only tests use it here.
+func kernel12x32Narrow(f panelFormat, a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel12x32PortableNarrow(f, a0, a1, b0, b1, k, c, ldc, bias, mode)
 }
 
 // gemvPanels computes one row against panels (1 or 4) consecutive panels;
@@ -58,7 +62,26 @@ func gemvPanels(a, b *float32, panelStride, k, panels int, out *[4 * nr]float32)
 	gemvGo(a, b, panelStride, k, panels, out[:])
 }
 
-// gemvPanelsHalf is gemvPanels for fp16 panels.
-func gemvPanelsHalf(a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
-	gemvGoHalf(a, b, panelStride, k, panels, out[:])
+// gemvPanelsNarrow is gemvPanels for 16-bit panels in format f.
+func gemvPanelsNarrow(f panelFormat, a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
+	gemvGoNarrow(f, a, b, panelStride, k, panels, out[:])
+}
+
+// Int8Panels reports whether int8 panels run at SIMD speed here: false, as
+// the portable kernel converts every value.
+func Int8Panels() bool { return false }
+
+// kernel6x16Int8 is the int8-panel microkernel; see kernel_go.go.
+func kernel6x16Int8(a *float32, b *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel6x16PortableInt8(a, b, k, c, ldc, bias, mode)
+}
+
+// kernel12x32Int8 is the int8-panel wide kernel; only tests use it here.
+func kernel12x32Int8(a0, a1 *float32, b0, b1 *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel12x32PortableInt8(a0, a1, b0, b1, k, c, ldc, bias, mode)
+}
+
+// gemvPanelsInt8 is gemvPanels for int8 panels.
+func gemvPanelsInt8(a *float32, b *int8, panelStride, k, panels int, out *[4 * nr]float32) {
+	gemvGoInt8(a, b, panelStride, k, panels, out[:])
 }

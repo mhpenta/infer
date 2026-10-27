@@ -163,6 +163,10 @@ func AttentionQKVInto(out, qkv *tensor.Tensor, heads int, scale float32) {
 // AttentionArgs configures AttentionStrided.
 type AttentionArgs struct {
 	Heads int
+	// KVHeads is the number of key and value heads, for grouped-query
+	// attention: query head h reads key/value head h/(Heads/KVHeads). 0
+	// means Heads.
+	KVHeads int
 	// Scale multiplies q·kᵀ: 1/√headDim for BERT, 1 for T5.
 	Scale float32
 	// Bias, if not nil, is added to the scaled scores before the softmax:
@@ -175,16 +179,32 @@ type AttentionArgs struct {
 	Offset int
 }
 
+// kvHeads returns the number of key and value heads.
+func (a AttentionArgs) kvHeads() int {
+	if a.KVHeads == 0 {
+		return a.Heads
+	}
+	return a.KVHeads
+}
+
+// checkHeads panics unless the query heads split evenly into kvHeads groups.
+func (a AttentionArgs) checkHeads(name string) {
+	if kv := a.kvHeads(); a.Heads <= 0 || kv <= 0 || a.Heads%kv != 0 {
+		panic(fmt.Sprintf("ops.%s: %d query heads do not split into %d key/value heads", name, a.Heads, kv))
+	}
+}
+
 // AttentionStrided computes multi-head attention, softmax(Scale·q·kᵀ + Bias,
 // with the causal mask)·v for each head, on strided views: row i of q starts
 // at q[i*ldq], rows of k and v at multiples of ldk and ldv, and the context
-// for query i is written to out[i*ldOut:]. Each view holds hidden columns,
-// split evenly into heads. Heads run in parallel; each head's two products
-// run serially on views of its columns, and only k and v are copied, into
-// panels.
+// for query i is written to out[i*ldOut:]. q and out hold hidden columns,
+// split evenly into args.Heads; k and v hold args.KVHeads heads of the same
+// size. Each key/value head is packed once, then heads run in parallel, each
+// head's two products serially on views of its columns.
 func AttentionStrided(out []float32, ldOut int, q []float32, ldq int, k []float32, ldk int, v []float32, ldv int, seq, kvSeq, hidden int, args AttentionArgs) {
-	heads := args.Heads
-	if heads <= 0 || hidden%heads != 0 {
+	args.checkHeads("AttentionStrided")
+	heads, kvHeads := args.Heads, args.kvHeads()
+	if hidden%heads != 0 {
 		panic(fmt.Sprintf("ops.AttentionStrided: %d columns do not split into %d heads", hidden, heads))
 	}
 	if args.Bias != nil && len(args.Bias) != heads*seq*kvSeq {
@@ -194,46 +214,74 @@ func AttentionStrided(out []float32, ldOut int, q []float32, ldq int, k []float3
 		panic(fmt.Sprintf("ops.AttentionStrided: %d causal queries after %d cached positions need %d keys, have %d", seq, args.Offset, args.Offset+seq, kvSeq))
 	}
 	headDim := hidden / heads
-	forEach(heads, workersFor(2*seq*kvSeq*hidden), func(h int) {
+	workers := workersFor(2 * seq * kvSeq * hidden)
+	kSize, vSize := packedSize(kvSeq, headDim), packedSize(headDim, kvSeq)
+	buf := getScratch(kvHeads * (kSize + vSize))
+	defer scratch.Put(buf)
+	kps, vps := make([]Packed, kvHeads), make([]Packed, kvHeads)
+	forEach(kvHeads, workers, func(g int) {
+		off, packed := g*headDim, (*buf)[g*(kSize+vSize):]
+		kps[g] = packTInto(packed[:kSize], k[off:], kvSeq, headDim, ldk)
+		vps[g] = packNInto(packed[kSize:kSize+vSize], v[off:], kvSeq, headDim, ldv)
+	})
+	attendHeads(out, ldOut, q, ldq, seq, headDim, kps, vps, args, workers)
+}
+
+// attendHeads runs every query head's attention over packed key/value heads,
+// query head h reading group h/(heads/len(kps)).
+func attendHeads(out []float32, ldOut int, q []float32, ldq, seq, headDim int, kps, vps []Packed, args AttentionArgs, workers int) {
+	heads := args.Heads
+	group := heads / len(kps)
+	if seq == 1 && group > 1 {
+		// One query per head (a decoding step): a group's queries are
+		// consecutive in q, so they go through each product together, the
+		// keys and values read once. The kernels sum each row the same way
+		// whatever the number of rows, so this is bit-identical to one head
+		// at a time.
+		forEach(len(kps), workers, func(g int) {
+			off := g * group * headDim
+			attendRows(out[off:], headDim, q[off:], headDim, group, &kps[g], &vps[g], g*group, 0, args)
+		})
+		return
+	}
+	forEach(heads, workers, func(h int) {
 		off := h * headDim
-		kSize, vSize := packedSize(kvSeq, headDim), packedSize(headDim, kvSeq)
-		buf := getScratch(kSize + vSize)
-		defer scratch.Put(buf)
-		kp := packTInto((*buf)[:kSize], k[off:], kvSeq, headDim, ldk)
-		vp := packNInto((*buf)[kSize:], v[off:], kvSeq, headDim, ldv)
-		attendHead(out[off:], ldOut, q[off:], ldq, seq, &kp, &vp, h, args)
+		attendRows(out[off:], ldOut, q[off:], ldq, seq, &kps[h/group], &vps[h/group], h*seq, 1, args)
 	})
 }
 
-// attendHead computes one head's attention for seq queries (row i at
-// q[i*ldq]) over keys kp (packed for q·kᵀ) and values vp (packed for
-// probs·v), writing the context for query i to out[i*ldOut:].
-func attendHead(out []float32, ldOut int, q []float32, ldq, seq int, kp, vp *Packed, h int, args AttentionArgs) {
+// attendRows computes attention for rows queries (row r at q[r*ldq]) over
+// keys kp (packed for q·kᵀ) and values vp (packed for probs·v), writing row
+// r's context to out[r*ldOut:]. Row r uses row biasRow0+r of args.Bias and,
+// with args.Causal, sees keys up to args.Offset+queryStep·r: queryStep is 1
+// when the rows are successive queries of one head, 0 when they are heads of
+// one query.
+func attendRows(out []float32, ldOut int, q []float32, ldq, rows int, kp, vp *Packed, biasRow0, queryStep int, args AttentionArgs) {
 	kvSeq := kp.n
-	buf := getScratch(seq * kvSeq)
+	buf := getScratch(rows * kvSeq)
 	defer scratch.Put(buf)
 	scores := *buf
-	gemm(seq, q, ldq, kp, nil, scores, kvSeq, 1)
-	for i := range seq {
-		row := scores[i*kvSeq : (i+1)*kvSeq]
+	gemm(rows, q, ldq, kp, nil, scores, kvSeq, 1)
+	for r := range rows {
+		row := scores[r*kvSeq : (r+1)*kvSeq]
 		scale := args.Scale
 		if args.Bias != nil {
 			// The bias is added after scaling, so scale here and let the
 			// softmax run unscaled.
-			bias := args.Bias[(h*seq+i)*kvSeq : (h*seq+i+1)*kvSeq]
+			bias := args.Bias[(biasRow0+r)*kvSeq : (biasRow0+r+1)*kvSeq]
 			for j := range row {
 				row[j] = row[j]*scale + bias[j]
 			}
 			scale = 1
 		}
 		if args.Causal {
-			for j := args.Offset + i + 1; j < kvSeq; j++ {
+			for j := args.Offset + queryStep*r + 1; j < kvSeq; j++ {
 				row[j] = float32(math.Inf(-1))
 			}
 		}
 		softmaxScaled(row, scale)
 	}
-	gemm(seq, scores, kvSeq, vp, nil, out, ldOut, 1)
+	gemm(rows, scores, kvSeq, vp, nil, out, ldOut, 1)
 }
 
 // KVCache holds attention keys and values packed per head, for attention
@@ -314,24 +362,23 @@ func (c *KVCache) Append(k []float32, ldk int, v []float32, ldv int, count int) 
 	}
 }
 
-// Attend computes attention for seq queries (row i at q[i*ldq], heads·headDim
-// wide) over every cached position, writing the context for query i to
-// out[i*ldOut:]. args.Heads must match the cache; with args.Causal, the
+// Attend computes attention for seq queries (row i at q[i*ldq],
+// args.Heads·headDim wide) over every cached position, writing the context
+// for query i to out[i*ldOut:]. The cache holds the key/value heads:
+// args.KVHeads (or, when 0, args.Heads) must match it. With args.Causal, the
 // queries are positions args.Offset.. of the cache.
 func (c *KVCache) Attend(out []float32, ldOut int, q []float32, ldq int, seq int, args AttentionArgs) {
-	if args.Heads != c.heads {
-		panic(fmt.Sprintf("ops.KVCache.Attend: %d heads, cache has %d", args.Heads, c.heads))
+	args.checkHeads("KVCache.Attend")
+	if args.kvHeads() != c.heads {
+		panic(fmt.Sprintf("ops.KVCache.Attend: %d key/value heads, cache has %d", args.kvHeads(), c.heads))
 	}
-	if args.Bias != nil && len(args.Bias) != c.heads*seq*c.n {
-		panic(fmt.Sprintf("ops.KVCache.Attend: bias has %d values, want %d·%d·%d", len(args.Bias), c.heads, seq, c.n))
+	if args.Bias != nil && len(args.Bias) != args.Heads*seq*c.n {
+		panic(fmt.Sprintf("ops.KVCache.Attend: bias has %d values, want %d·%d·%d", len(args.Bias), args.Heads, seq, c.n))
 	}
 	if args.Causal && args.Offset+seq > c.n {
 		panic(fmt.Sprintf("ops.KVCache.Attend: %d causal queries after %d positions need %d keys, have %d", seq, args.Offset, args.Offset+seq, c.n))
 	}
-	forEach(c.heads, workersFor(2*seq*c.n*c.heads*c.headDim), func(h int) {
-		off := h * c.headDim
-		attendHead(out[off:], ldOut, q[off:], ldq, seq, &c.keys[h], &c.values[h], h, args)
-	})
+	attendHeads(out, ldOut, q, ldq, seq, c.headDim, c.keys, c.values, args, workersFor(2*seq*c.n*args.Heads*c.headDim))
 }
 
 // RMSNorm scales each row of x in place to unit root mean square, then by
@@ -359,6 +406,33 @@ func RMSNorm(x, weight *tensor.Tensor, eps float64) {
 func ReLU(x []float32) {
 	for i, v := range x {
 		x[i] = max(v, 0)
+	}
+}
+
+// SiLU applies x·sigmoid(x) in place, computed as x/(1+e^-x) like PyTorch.
+func SiLU(x []float32) {
+	for i, v := range x {
+		x[i] = silu(v)
+	}
+}
+
+func silu(v float32) float32 { return v / (1 + expf(-v)) }
+
+// SwiGLUInto sets out [rows, ff] to SiLU(gate)·up, the gated feed-forward
+// activation of Llama-family models, where gateUp [rows, 2·ff] holds the
+// gate projection's output in its first ff columns and the up projection's
+// in the rest (one Linear over both weights).
+func SwiGLUInto(out, gateUp *tensor.Tensor) {
+	ff := out.Cols()
+	if gateUp.Rows() != out.Rows() || gateUp.Cols() != 2*ff {
+		panic(fmt.Sprintf("ops.SwiGLUInto: out is %v, gateUp %v", out.Shape, gateUp.Shape))
+	}
+	for i := range out.Rows() {
+		gu, o := gateUp.Row(i), out.Row(i)
+		gate, up := gu[:ff], gu[ff:]
+		for j, g := range gate {
+			o[j] = silu(g) * up[j]
+		}
 	}
 }
 

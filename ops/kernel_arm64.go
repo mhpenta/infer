@@ -61,14 +61,30 @@ func peakWideLoop(iters int) bool { return false }
 // SIMD kernel that widens them (the portable one converts every value).
 func HalfPanels() bool { return false }
 
-// kernel6x16Half is the fp16-panel microkernel; only tests use it here.
-func kernel6x16Half(a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
-	kernel6x16PortableHalf(a, b, k, c, ldc, bias, mode)
+// BF16Panels reports whether bf16 panels run at SIMD speed here: true, as the
+// NEON kernels widen them in registers.
+func BF16Panels() bool { return true }
+
+// kernel6x16NEONB is kernel6x16NEON for a bf16 panel (kernel_bf16_arm64.s).
+//
+//go:noescape
+func kernel6x16NEONB(a *float32, b *uint16, k int, out *[mr * nr]float32)
+
+// kernel6x16Narrow is the 16-bit-panel microkernel; see kernel_go.go. fp16
+// panels only meet the portable kernel here, in tests.
+func kernel6x16Narrow(f panelFormat, a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	if f != formatBF16 {
+		kernel6x16PortableNarrow(f, a, b, k, c, ldc, bias, mode)
+		return
+	}
+	var out [mr * nr]float32
+	kernel6x16NEONB(a, b, k, &out)
+	epilogueGo(&out, c, ldc, bias, mode)
 }
 
-// kernel12x32Half is the fp16-panel wide kernel; only tests use it here.
-func kernel12x32Half(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
-	kernel12x32PortableHalf(a0, a1, b0, b1, k, c, ldc, bias, mode)
+// kernel12x32Narrow is the 16-bit-panel wide kernel; only tests use it here.
+func kernel12x32Narrow(f panelFormat, a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel12x32PortableNarrow(f, a0, a1, b0, b1, k, c, ldc, bias, mode)
 }
 
 // One-row kernels (gemv_arm64.s), 4 or 1 float32 panels.
@@ -89,8 +105,61 @@ func gemvPanels(a, b *float32, panelStride, k, panels int, out *[4 * nr]float32)
 	gemv1NEON(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
 }
 
-// gemvPanelsHalf is gemvPanels for fp16 panels, which arm64 only meets in
-// tests (HalfPanels is false here).
-func gemvPanelsHalf(a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
-	gemvGoHalf(a, b, panelStride, k, panels, out[:])
+// One-row kernels for bf16 panels (kernel_bf16_arm64.s).
+//
+//go:noescape
+func gemv4NEONB(a *float32, b *uint16, panelStride, k int, out *[4 * nr]float32)
+
+//go:noescape
+func gemv1NEONB(a *float32, b *uint16, panelStride, k int, out *[nr]float32)
+
+// gemvPanelsNarrow is gemvPanels for 16-bit panels in format f. fp16 panels
+// only meet the portable loop here, in tests (HalfPanels is false).
+func gemvPanelsNarrow(f panelFormat, a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
+	switch {
+	case f != formatBF16:
+		gemvGoNarrow(f, a, b, panelStride, k, panels, out[:])
+	case panels == 4:
+		gemv4NEONB(a, b, panelStride, k, out)
+	default:
+		gemv1NEONB(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
+	}
+}
+
+// Int8Panels reports whether int8 panels run at SIMD speed here: true, as
+// the NEON kernels widen them in registers.
+func Int8Panels() bool { return true }
+
+// kernel6x16NEONI is kernel6x16NEON for an int8 panel (kernel_int8_arm64.s).
+//
+//go:noescape
+func kernel6x16NEONI(a *float32, b *int8, k int, out *[mr * nr]float32)
+
+// kernel6x16Int8 is the int8-panel microkernel; see kernel_go.go.
+func kernel6x16Int8(a *float32, b *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	var out [mr * nr]float32
+	kernel6x16NEONI(a, b, k, &out)
+	epilogueGo(&out, c, ldc, bias, mode)
+}
+
+// kernel12x32Int8 is the int8-panel wide kernel; only tests use it here.
+func kernel12x32Int8(a0, a1 *float32, b0, b1 *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	kernel12x32PortableInt8(a0, a1, b0, b1, k, c, ldc, bias, mode)
+}
+
+// One-row kernels for int8 panels (kernel_int8_arm64.s).
+//
+//go:noescape
+func gemv4NEONI(a *float32, b *int8, panelStride, k int, out *[4 * nr]float32)
+
+//go:noescape
+func gemv1NEONI(a *float32, b *int8, panelStride, k int, out *[nr]float32)
+
+// gemvPanelsInt8 is gemvPanels for int8 panels.
+func gemvPanelsInt8(a *float32, b *int8, panelStride, k, panels int, out *[4 * nr]float32) {
+	if panels == 4 {
+		gemv4NEONI(a, b, panelStride, k, out)
+		return
+	}
+	gemv1NEONI(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
 }

@@ -31,6 +31,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/mhpenta/infer/tokenizer/internal/hf"
 )
 
 // unkPenalty is how much lower than the lowest piece score an unknown
@@ -59,32 +61,21 @@ type Tokenizer struct {
 	unkID       int
 	unkScore    float64
 
-	added   []addedToken // longest first, for matching
+	added   *hf.Added
 	special map[int]bool
 	content map[int]string // ids of added tokens beyond the vocabulary
 
-	normalizers  []func(string) string
-	wsSplit      bool
-	meta         *metaspace
-	template     []templateItem
-	decodeMeta   *metaspace
-	templateSize int
-}
-
-type addedToken struct {
-	id      int
-	content string
+	normalizers []func(string) string
+	wsSplit     bool
+	meta        *metaspace
+	template    hf.Template
+	decodeMeta  *metaspace
 }
 
 type metaspace struct {
 	replacement string
 	prepend     string // "always", "first" or "never"
 	split       bool
-}
-
-type templateItem struct {
-	sequence bool
-	ids      []int
 }
 
 // LoadDir loads tokenizer.json and reads model_max_length and
@@ -122,12 +113,7 @@ func Load(path string, config Config) (*Tokenizer, error) {
 		return nil, fmt.Errorf("unigram: %w", err)
 	}
 	var tj struct {
-		AddedTokens []struct {
-			ID         int    `json:"id"`
-			Content    string `json:"content"`
-			Special    bool   `json:"special"`
-			Normalized bool   `json:"normalized"`
-		} `json:"added_tokens"`
+		AddedTokens   []hf.AddedToken `json:"added_tokens"`
 		Normalizer    json.RawMessage `json:"normalizer"`
 		PreTokenizer  json.RawMessage `json:"pre_tokenizer"`
 		PostProcessor json.RawMessage `json:"post_processor"`
@@ -175,11 +161,13 @@ func Load(path string, config Config) (*Tokenizer, error) {
 	}
 	t.unkScore = minScore - unkPenalty
 
+	if t.added, err = hf.NewAdded(tj.AddedTokens); err != nil {
+		return nil, fmt.Errorf("unigram: %w", err)
+	}
 	for _, a := range tj.AddedTokens {
 		if a.Normalized {
 			return nil, fmt.Errorf("unigram: added token %q is matched after normalization, which is not supported", a.Content)
 		}
-		t.added = append(t.added, addedToken{id: a.ID, content: a.Content})
 		if a.Special {
 			t.special[a.ID] = true
 		}
@@ -194,8 +182,8 @@ func Load(path string, config Config) (*Tokenizer, error) {
 	if err := t.parsePreTokenizer(tj.PreTokenizer); err != nil {
 		return nil, err
 	}
-	if err := t.parsePostProcessor(tj.PostProcessor); err != nil {
-		return nil, err
+	if t.template, err = hf.ParseTemplate(tj.PostProcessor); err != nil {
+		return nil, fmt.Errorf("unigram: %w", err)
 	}
 	if err := t.parseDecoder(tj.Decoder); err != nil {
 		return nil, err
@@ -204,7 +192,7 @@ func Load(path string, config Config) (*Tokenizer, error) {
 }
 
 func (t *Tokenizer) parseNormalizer(raw json.RawMessage) error {
-	if isNull(raw) {
+	if hf.IsNull(raw) {
 		return nil
 	}
 	var n struct {
@@ -262,7 +250,7 @@ func (t *Tokenizer) parseNormalizer(raw json.RawMessage) error {
 }
 
 func (t *Tokenizer) parsePreTokenizer(raw json.RawMessage) error {
-	if isNull(raw) {
+	if hf.IsNull(raw) {
 		return nil
 	}
 	var p struct {
@@ -296,48 +284,8 @@ func (t *Tokenizer) parsePreTokenizer(raw json.RawMessage) error {
 	return nil
 }
 
-func (t *Tokenizer) parsePostProcessor(raw json.RawMessage) error {
-	if isNull(raw) {
-		return nil
-	}
-	var p struct {
-		Type   string `json:"type"`
-		Single []struct {
-			Sequence *struct {
-				ID string `json:"id"`
-			} `json:"Sequence"`
-			SpecialToken *struct {
-				ID string `json:"id"`
-			} `json:"SpecialToken"`
-		} `json:"single"`
-		SpecialTokens map[string]struct {
-			IDs []int `json:"ids"`
-		} `json:"special_tokens"`
-	}
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return fmt.Errorf("unigram: parse post_processor: %w", err)
-	}
-	if p.Type != "TemplateProcessing" {
-		return fmt.Errorf("unigram: post_processor %q is not supported", p.Type)
-	}
-	for _, item := range p.Single {
-		switch {
-		case item.Sequence != nil:
-			t.template = append(t.template, templateItem{sequence: true})
-		case item.SpecialToken != nil:
-			st, ok := p.SpecialTokens[item.SpecialToken.ID]
-			if !ok {
-				return fmt.Errorf("unigram: template token %q has no ids", item.SpecialToken.ID)
-			}
-			t.template = append(t.template, templateItem{ids: st.IDs})
-			t.templateSize += len(st.IDs)
-		}
-	}
-	return nil
-}
-
 func (t *Tokenizer) parseDecoder(raw json.RawMessage) error {
-	if isNull(raw) {
+	if hf.IsNull(raw) {
 		return nil
 	}
 	var d struct {
@@ -387,55 +335,22 @@ func parseMetaspace(raw json.RawMessage) (*metaspace, error) {
 	return ms, nil
 }
 
-func isNull(raw json.RawMessage) bool {
-	return len(raw) == 0 || string(raw) == "null"
-}
-
 // Encode returns the ids for text, including the post-processor's tokens.
 func (t *Tokenizer) Encode(text string) []int {
 	var ids []int
 	first := true
-	for text != "" {
-		pos, tok := t.nextAdded(text)
-		if pos > 0 {
-			ids = append(ids, t.encodeText(text[:pos], first)...)
+	for _, seg := range t.added.Split(text, nil) {
+		if seg.Token != nil {
+			ids = append(ids, seg.Token.ID)
+		} else {
+			ids = append(ids, t.encodeText(seg.Text, first)...)
 		}
-		if tok == nil {
-			break
-		}
-		ids = append(ids, tok.id)
 		first = false
-		text = text[pos+len(tok.content):]
 	}
-	if limit := t.config.MaxLength - t.templateSize; t.config.MaxLength > 0 && len(ids) > limit {
+	if limit := t.config.MaxLength - t.template.Size(); t.config.MaxLength > 0 && len(ids) > limit {
 		ids = ids[:max(limit, 0)]
 	}
-	if t.template == nil {
-		return ids
-	}
-	var out []int
-	for _, item := range t.template {
-		if item.sequence {
-			out = append(out, ids...)
-		} else {
-			out = append(out, item.ids...)
-		}
-	}
-	return out
-}
-
-// nextAdded finds the leftmost added token in text, preferring the longest
-// at a position. It returns len(text) and nil when there is none.
-func (t *Tokenizer) nextAdded(text string) (int, *addedToken) {
-	best, bestTok := len(text), (*addedToken)(nil)
-	for i := range t.added {
-		a := &t.added[i]
-		j := strings.Index(text, a.content)
-		if j >= 0 && (j < best || (j == best && len(a.content) > len(bestTok.content))) {
-			best, bestTok = j, a
-		}
-	}
-	return best, bestTok
+	return t.template.Apply(ids)
 }
 
 // encodeText runs normalization, pre-tokenization and segmentation on a
@@ -590,20 +505,9 @@ func (t *Tokenizer) Decode(ids []int, skipSpecial bool) string {
 	}
 	out := b.String()
 	if t.config.CleanUpSpaces {
-		out = cleanUp(out)
+		out = hf.CleanUp(out)
 	}
 	return out
-}
-
-// cleanUp is transformers' clean_up_tokenization.
-func cleanUp(s string) string {
-	for _, r := range [][2]string{
-		{" .", "."}, {" ?", "?"}, {" !", "!"}, {" ,", ","}, {" ' ", "'"},
-		{" n't", "n't"}, {" 'm", "'m"}, {" 's", "'s"}, {" 've", "'ve"}, {" 're", "'re"},
-	} {
-		s = strings.ReplaceAll(s, r[0], r[1])
-	}
-	return s
 }
 
 // VocabSize returns the number of ids, including added tokens past the

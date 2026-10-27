@@ -3,9 +3,11 @@
 # pinned Hugging Face revisions, and check them against known hashes. Tests
 # that need a model skip when it is missing.
 #
-#   scripts/fetch_models.sh            # all models (~1 GB)
+#   scripts/fetch_models.sh            # all models (~3.2 GB)
 #   scripts/fetch_models.sh minilm     # just all-MiniLM-L6-v2 (~90 MB)
 #   scripts/fetch_models.sh t5         # just t5-small (~240 MB)
+#   scripts/fetch_models.sh minicpm5   # just MiniCPM5-1B (~2.2 GB, bf16)
+#   scripts/fetch_models.sh minicpm5-2b # MiniCPM5-2B (~5 GB, bf16; not in "all")
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -48,4 +50,28 @@ if [ "$want" = all ] || [ "$want" = t5 ]; then
 		'bd944e5f1b3ad9b70dd9d00010a517059e19265671076b8b0a4a58d9491842bc  model.safetensors' \
 		'd2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066  tokenizer.json' \
 		'd1e7146101aa96282057f374aa9c3b260fba2109e5990edb1775d6efc70ffa3c  tokenizer_config.json'
+fi
+
+if [ "$want" = all ] || [ "$want" = minicpm5 ]; then
+	fetch minicpm5-1b openbmb/MiniCPM5-1B 87179e5c1f455ef22e6223592d2d61351b525bfc \
+		'6a6509b646cb3169616c5ffc3196e7ccaf9d4d6bc17b266581d241a31c217714  config.json' \
+		'92afd6424501426eddcf7e1542f013d19e5987544977b4ee7bd26359bd5fd2ab  generation_config.json' \
+		'7ab8fd86563125929be78aeec8cb3969c7ed2ead3be1ab9d3ec0a9fa69c8660d  model-00000-of-00001.safetensors' \
+		'162add042e75abc3d571c4a8679523fa4f1ffc55d1fea25fc6658a19d6e957ee  model.safetensors.index.json' \
+		'3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81  tokenizer.json' \
+		'094efb3cf1ff412284cc5945fc99dff58673a912760d04483a04aa1c716f66fd  tokenizer_config.json' \
+		'82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db  special_tokens_map.json' \
+		'7451a05cf1e28a79d97d7c0bc951028c0b1915119bf9046acd06a0e3d931f47c  chat_template.jinja'
+fi
+
+if [ "$want" = minicpm5-2b ]; then
+	fetch minicpm5-2b openbmb/MiniCPM5-2B f97400052a43d642bbc6e9975e2397e3ae6a6b52 \
+		'59613157e5357d62bcb121e04cb90f2170b43d789b142380c12c3d4277d95180  config.json' \
+		'9ac4f32e5f32358697a9f438a3ea89ef80e6ba786c72c49e932f9f21c122fdb1  generation_config.json' \
+		'14fb8e7f0a18d53d1f239773758bf581cee7e456a4523a54622c3a245b64402c  model-00000-of-00001.safetensors' \
+		'6d839cd76e8395de548a0e6cc310386f66d1ecbb2c75d198a8dfd3d70892b756  model.safetensors.index.json' \
+		'3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81  tokenizer.json' \
+		'e9b1064649e771d7a8e15637c68b2d2749724877ba3648bd74a4ece31c26303b  tokenizer_config.json' \
+		'82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db  special_tokens_map.json' \
+		'bc1f78ef8a86b6bdf64a056cf89dd0ac506db4f198ab363d85168e2500ab44dd  chat_template.jinja'
 fi

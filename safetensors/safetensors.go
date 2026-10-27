@@ -143,6 +143,14 @@ func (f *File) Tensor(name string) (*tensor.Tensor, error) {
 		return tensor.FromData(out, shape...), nil
 	case "BF16":
 		out := make([]float32, n)
+		if n > 0 && littleEndian() && uintptr(unsafe.Pointer(&b[0]))%2 == 0 {
+			// A bf16 value is the top half of a float32: widen in place.
+			bits := unsafe.Slice((*uint32)(unsafe.Pointer(&out[0])), n)
+			for i, h := range unsafe.Slice((*uint16)(unsafe.Pointer(&b[0])), n) {
+				bits[i] = uint32(h) << 16
+			}
+			return tensor.FromData(out, shape...), nil
+		}
 		for i := range out {
 			out[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(b[2*i:])) << 16)
 		}
@@ -150,6 +158,30 @@ func (f *File) Tensor(name string) (*tensor.Tensor, error) {
 	default:
 		return nil, fmt.Errorf("safetensors: tensor %q has unsupported dtype %s", name, e.DType)
 	}
+}
+
+// Ints returns an integer tensor (I32 or I64), converted to int, and its
+// shape.
+func (f *File) Ints(name string) ([]int, []int, error) {
+	e, ok := f.entries[name]
+	if !ok {
+		return nil, nil, fmt.Errorf("safetensors: no tensor %q", name)
+	}
+	b := f.data[e.Offsets[0]:e.Offsets[1]]
+	out := make([]int, numel(e.Shape))
+	switch e.DType {
+	case "I32":
+		for i := range out {
+			out[i] = int(int32(binary.LittleEndian.Uint32(b[4*i:])))
+		}
+	case "I64":
+		for i := range out {
+			out[i] = int(int64(binary.LittleEndian.Uint64(b[8*i:])))
+		}
+	default:
+		return nil, nil, fmt.Errorf("safetensors: tensor %q is %s, not an integer tensor", name, e.DType)
+	}
+	return out, slices.Clone(e.Shape), nil
 }
 
 // Close unmaps the file. Tensors returned as views must not be used afterwards.

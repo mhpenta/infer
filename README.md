@@ -13,6 +13,8 @@ reference outputs dumped from `transformers` (see [Testing](#testing)).
 | [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (BERT, 22M) | 384-dim mean-pooled embedding | every layer within 5e-6, cosine 1.000000000 |
 | [mxbai-embed-large-v1](https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1) (BERT, 335M, fp16) | 512-bit binary embedding (CLS, normalize, Matryoshka 512, sign bits) | bit-identical on 20 texts |
 | [t5-small](https://huggingface.co/google-t5/t5-small) (T5, 60M) and T5 fine-tunes | greedy generation with a KV cache | every encoder and decoder layer within 1.5e-6 of its range; generated tokens identical on 5 inputs up to 512 tokens |
+| [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) (Llama architecture, 1.1B, bf16) | greedy generation with a KV cache, chat template | every layer within 5.8e-6 of its range; top-64 logits within 1e-5 at every position; generated tokens identical on 4 prompts up to 2,461 tokens |
+| [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B) (same architecture, 42 layers, bf16) | the same, with its own chat template | chat template matches transformers on 12 conversations; generated tokens identical on 3 prompts (not in CI: 5 GB, `scripts/fetch_models.sh minicpm5-2b`) |
 
 ## Packages
 
@@ -23,8 +25,12 @@ reference outputs dumped from `transformers` (see [Testing](#testing)).
 | `safetensors` | memory-mapped `.safetensors` reader (F32 zero-copy, F16/BF16 upcast) |
 | `tokenizer/wordpiece` | BERT's tokenizer, matching Hugging Face's fast `BertTokenizer` |
 | `tokenizer/unigram` | SentencePiece Unigram from `tokenizer.json` (T5), including the precompiled NFKC character map |
+| `tokenizer/bpe` | byte-level BPE from `tokenizer.json` (MiniCPM5 and other GPT-2-style tokenizers), with the GPT-4-style split pattern as a hand-written scanner |
+| `tokenizer/chat` | chat templates in Go, recognized by the hash of the model's Jinja template (MiniCPM5-1B and -2B so far) |
 | `model/bert` | the BERT encoder |
 | `model/t5` | the T5 encoder-decoder: relative position bias, cross-attention, greedy decoding with a KV cache |
+| `model/llama` | Llama-family decoders (`LlamaForCausalLM`): grouped-query attention, rotary embeddings, SwiGLU, bf16 or int8 weights (`llama.LoadWith(dir, llama.Options{Int8: true})`), greedy or sampled decoding with a KV cache |
+| `sample` | choosing the next token: greedy, or temperature, top-k, top-p and repetition penalty with transformers' meaning and order, defaults read from `generation_config.json`; the distributions match transformers' logits processors |
 | `pool` | mean and CLS pooling, L2 normalization |
 | `quant` | sentence-transformers' binary quantization |
 | `cmd/embed` | a small CLI: `go run ./cmd/embed <model_dir> "some text"` |
@@ -47,6 +53,26 @@ out, err := model.Generate(tok.Encode("translate English to German: The house is
 fmt.Println(tok.Decode(out, true)) // Das Haus ist wunderbar.
 ```
 
+```go
+tok, err := bpe.LoadDir(dir)    // tokenizer.json + tokenizer_config.json
+tmpl, err := chat.Load(dir)     // chat_template.jinja, recognized by its hash
+model, err := llama.Load(dir)   // config.json + safetensors shards
+defer model.Close()
+
+prompt, err := tmpl.Render([]chat.Message{{Role: "user", Content: "What is 17 * 23? Answer with just the number."}},
+	chat.Options{AddGenerationPrompt: true, Thinking: chat.ThinkingOff})
+out, err := model.Generate(tok.EncodeRaw(prompt), 64)
+fmt.Println(tok.Decode(out, true)) // 17 * 23 = 391
+
+// Or sample, with the model's own settings (MiniCPM5-2B: temperature 1, top-k 50, top-p 0.95).
+cfg, err := sample.LoadConfig(dir) // generation_config.json, with transformers' defaults
+s, err := sample.New(cfg, seed)
+err = model.GenerateWith(tok.EncodeRaw(prompt), 512, s, func(token int, _ []float32) bool {
+	out = append(out, token)
+	return true
+})
+```
+
 ## How the matrix products work
 
 `ops` follows the design of BLIS and OpenBLAS. Weights are packed once, at load
@@ -61,9 +87,17 @@ and loops are blocked for the caches.
 | arm64 | 6×16 NEON, 24 accumulators | |
 | anything else, or `-tags purego` | portable Go | |
 
-Weights stored as fp16 (like mxbai's) stay fp16 in memory and are widened in
-registers by the x86 kernels: half the memory and bandwidth, the same float32
-values, so outputs are unchanged. Softmax and GELU use AVX2 vector loops on
+Weights stored as fp16 (like mxbai's) or bf16 (like most language models) can
+stay in that format in memory (`ops.PackHalf`, `ops.PackBF16`) and be widened
+to float32 in registers: half the memory and bandwidth, the same float32
+values, so outputs are bit-identical. fp16 is widened by the x86 kernels; bf16
+by the x86 and NEON kernels. Any weight can instead be quantized to int8
+(`ops.PackInt8`, one scale per output column), which halves bf16's memory
+again; products are bit-identical to the float32 product on the integers,
+then scaled. The x86 and NEON kernels widen int8 in registers, but on NEON
+that costs enough instructions that generation is only 1.13–1.14× faster
+than bf16 (see [docs/int8-weights.md](docs/int8-weights.md), which also has
+the quality measurements). Softmax and GELU use AVX2 vector loops on
 x86. `ops.PeakGFLOPS`, `ops.KernelGFLOPS` and `ops.MatMulGFLOPS` measure the
 kernels on the machine they run on.
 
@@ -115,7 +149,8 @@ docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src -e INFER_REQUIRE_A
 ```
 
 The reference outputs in `testdata/golden` come from `scripts/dump_golden_bert.py`,
-`scripts/dump_golden_mxbai.py` and `scripts/dump_golden_t5.py` (PyTorch +
+`scripts/dump_golden_mxbai.py`, `scripts/dump_golden_t5.py`,
+`scripts/dump_golden_llama.py` and `scripts/dump_golden_sample.py` (PyTorch +
 transformers). `benchcmp/` is a
 separate module comparing the matrix product with gonum and vek.
 

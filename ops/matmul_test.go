@@ -268,6 +268,35 @@ func BenchmarkMatMulPacked(b *testing.B) {
 	}
 }
 
+// BenchmarkPanelFormats compares float32, bf16 and int8 panels on
+// MiniCPM5-2B's shapes (the stacked gate/up projection and the down
+// projection), for decoding (one row) and a 64-token prompt.
+func BenchmarkPanelFormats(b *testing.B) {
+	r := rand.New(rand.NewPCG(15, 16))
+	for _, s := range []struct{ n, k int }{{12288, 2048}, {2048, 6144}} {
+		w := narrowWeights(r, formatBF16, s.n, s.k)
+		bf16, err := PackBF16(w)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, f := range []struct {
+			name string
+			p    *Packed
+		}{{"f32", Pack(w)}, {"bf16", bf16}, {"int8", PackInt8(w)}} {
+			for _, m := range []int{1, 64} {
+				x := tensor.FromData(randomSlice(r, m*s.k), m, s.k)
+				y := tensor.New(m, s.n)
+				b.Run(fmt.Sprintf("%dx%dx%d/%s", m, s.n, s.k, f.name), func(b *testing.B) {
+					for b.Loop() {
+						LinearInto(y, x, f.p, nil)
+					}
+					b.ReportMetric(2*float64(m*s.n*s.k)*float64(b.N)/b.Elapsed().Seconds()/1e9, "GFLOP/s")
+				})
+			}
+		}
+	}
+}
+
 // TestWideDriverMatchesReference turns on the 12×32 tile path. Here it runs
 // the portable wide kernel (or AVX-512 where the self-check enabled it), so
 // the driver's mix of wide and 6×16 tiles is tested on every machine.

@@ -48,6 +48,8 @@ func checkWideKernel() error {
 		bias := randomFloats(r, 2*nr)
 		start := randomFloats(r, 2*mr*ldc)
 		h0, h1 := randomHalves(r, k*nr), randomHalves(r, k*nr)
+		f0, f1 := randomBF16(r, k*nr), randomBF16(r, k*nr)
+		q0, q1 := randomInt8(r, k*nr), randomInt8(r, k*nr)
 		for _, mode := range []int{storeC, storeBiasC, addC} {
 			got, want := append([]float32(nil), start...), append([]float32(nil), start...)
 			kernel12x32AVX512(&a0[0], &a1[0], &b0[0], &b1[0], k, &got[0], ldc, &bias[0], mode)
@@ -57,9 +59,21 @@ func checkWideKernel() error {
 			}
 			got, want = append(got[:0], start...), append(want[:0], start...)
 			kernel12x32AVX512H(&a0[0], &a1[0], &h0[0], &h1[0], k, &got[0], ldc, &bias[0], mode)
-			kernel12x32PortableHalf(&a0[0], &a1[0], &h0[0], &h1[0], k, &want[0], ldc, &bias[0], mode)
+			kernel12x32PortableNarrow(formatF16, &a0[0], &a1[0], &h0[0], &h1[0], k, &want[0], ldc, &bias[0], mode)
 			if err := closeEnough(got, want); err != nil {
 				return fmt.Errorf("fp16 panels, k=%d mode=%d: %w", k, mode, err)
+			}
+			got, want = append(got[:0], start...), append(want[:0], start...)
+			kernel12x32AVX512B(&a0[0], &a1[0], &f0[0], &f1[0], k, &got[0], ldc, &bias[0], mode)
+			kernel12x32PortableNarrow(formatBF16, &a0[0], &a1[0], &f0[0], &f1[0], k, &want[0], ldc, &bias[0], mode)
+			if err := closeEnough(got, want); err != nil {
+				return fmt.Errorf("bf16 panels, k=%d mode=%d: %w", k, mode, err)
+			}
+			got, want = append(got[:0], start...), append(want[:0], start...)
+			kernel12x32AVX512I(&a0[0], &a1[0], &q0[0], &q1[0], k, &got[0], ldc, &bias[0], mode)
+			kernel12x32PortableInt8(&a0[0], &a1[0], &q0[0], &q1[0], k, &want[0], ldc, &bias[0], mode)
+			if err := closeEnough(got, want); err != nil {
+				return fmt.Errorf("int8 panels, k=%d mode=%d: %w", k, mode, err)
 			}
 		}
 	}
@@ -169,26 +183,47 @@ func kernel6x16AVX2H(a *float32, b *uint16, k int, c *float32, ldc int, bias *fl
 //go:noescape
 func kernel12x32AVX512H(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int)
 
+// kernel6x16AVX2B is kernel6x16AVX2 for bf16 panels (widened with
+// VPMOVZXWD and a 16-bit left shift).
+//
+//go:noescape
+func kernel6x16AVX2B(a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int)
+
+// kernel12x32AVX512B is kernel12x32AVX512 for bf16 panels.
+//
+//go:noescape
+func kernel12x32AVX512B(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int)
+
 // HalfPanels reports whether fp16 panels pay off here: when the AVX2 kernels
 // (which widen them in registers) are in use.
 func HalfPanels() bool { return useAVX2 }
 
-// kernel6x16Half is the fp16-panel microkernel; see kernel_go.go.
-func kernel6x16Half(a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
-	if useAVX2 {
+// BF16Panels reports whether bf16 panels run at SIMD speed here: when the
+// AVX2 kernels (which widen them in registers) are in use.
+func BF16Panels() bool { return useAVX2 }
+
+// kernel6x16Narrow is the 16-bit-panel microkernel; see kernel_go.go.
+func kernel6x16Narrow(f panelFormat, a *float32, b *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	switch {
+	case !useAVX2:
+		kernel6x16PortableNarrow(f, a, b, k, c, ldc, bias, mode)
+	case f == formatBF16:
+		kernel6x16AVX2B(a, b, k, c, ldc, bias, mode)
+	default:
 		kernel6x16AVX2H(a, b, k, c, ldc, bias, mode)
-		return
 	}
-	kernel6x16PortableHalf(a, b, k, c, ldc, bias, mode)
 }
 
-// kernel12x32Half is the fp16-panel wide kernel; see kernel_go.go.
-func kernel12x32Half(a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
-	if useAVX512 {
+// kernel12x32Narrow is the 16-bit-panel wide kernel; see kernel_go.go.
+func kernel12x32Narrow(f panelFormat, a0, a1 *float32, b0, b1 *uint16, k int, c *float32, ldc int, bias *float32, mode int) {
+	switch {
+	case !useAVX512:
+		kernel12x32PortableNarrow(f, a0, a1, b0, b1, k, c, ldc, bias, mode)
+	case f == formatBF16:
+		kernel12x32AVX512B(a0, a1, b0, b1, k, c, ldc, bias, mode)
+	default:
 		kernel12x32AVX512H(a0, a1, b0, b1, k, c, ldc, bias, mode)
-		return
 	}
-	kernel12x32PortableHalf(a0, a1, b0, b1, k, c, ldc, bias, mode)
 }
 
 // kernel6x16 is the microkernel; see the contract in kernel_go.go.
@@ -235,7 +270,8 @@ func peakWideLoop(iters int) bool {
 	return true
 }
 
-// One-row kernels (gemv_amd64.s): 4 or 1 panels, float32 or fp16 panels.
+// One-row kernels (gemv_amd64.s): 4 or 1 panels, float32, fp16 or bf16
+// panels (int8 ones are declared with the int8 dispatch below).
 //
 //go:noescape
 func gemv4AVX2(a, b *float32, panelStride, k int, out *[4 * nr]float32)
@@ -248,6 +284,12 @@ func gemv4AVX2H(a *float32, b *uint16, panelStride, k int, out *[4 * nr]float32)
 
 //go:noescape
 func gemv1AVX2H(a *float32, b *uint16, panelStride, k int, out *[nr]float32)
+
+//go:noescape
+func gemv4AVX2B(a *float32, b *uint16, panelStride, k int, out *[4 * nr]float32)
+
+//go:noescape
+func gemv1AVX2B(a *float32, b *uint16, panelStride, k int, out *[nr]float32)
 
 // gemvPanels computes one row against panels (1 or 4) consecutive panels;
 // see gemvGo.
@@ -262,14 +304,70 @@ func gemvPanels(a, b *float32, panelStride, k, panels int, out *[4 * nr]float32)
 	}
 }
 
-// gemvPanelsHalf is gemvPanels for fp16 panels.
-func gemvPanelsHalf(a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
+// gemvPanelsNarrow is gemvPanels for 16-bit panels in format f.
+func gemvPanelsNarrow(f panelFormat, a *float32, b *uint16, panelStride, k, panels int, out *[4 * nr]float32) {
+	one := (*[nr]float32)(out[:nr])
 	switch {
 	case !useAVX2:
-		gemvGoHalf(a, b, panelStride, k, panels, out[:])
+		gemvGoNarrow(f, a, b, panelStride, k, panels, out[:])
+	case f == formatBF16 && panels == 4:
+		gemv4AVX2B(a, b, panelStride, k, out)
+	case f == formatBF16:
+		gemv1AVX2B(a, b, panelStride, k, one)
 	case panels == 4:
 		gemv4AVX2H(a, b, panelStride, k, out)
 	default:
-		gemv1AVX2H(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
+		gemv1AVX2H(a, b, panelStride, k, one)
+	}
+}
+
+// kernel6x16AVX2I is kernel6x16AVX2 for int8 panels (widened with VPMOVSXBD
+// and VCVTDQ2PS).
+//
+//go:noescape
+func kernel6x16AVX2I(a *float32, b *int8, k int, c *float32, ldc int, bias *float32, mode int)
+
+// kernel12x32AVX512I is kernel12x32AVX512 for int8 panels.
+//
+//go:noescape
+func kernel12x32AVX512I(a0, a1 *float32, b0, b1 *int8, k int, c *float32, ldc int, bias *float32, mode int)
+
+//go:noescape
+func gemv4AVX2I(a *float32, b *int8, panelStride, k int, out *[4 * nr]float32)
+
+//go:noescape
+func gemv1AVX2I(a *float32, b *int8, panelStride, k int, out *[nr]float32)
+
+// Int8Panels reports whether int8 panels run at SIMD speed here: when the
+// AVX2 kernels (which widen them in registers) are in use.
+func Int8Panels() bool { return useAVX2 }
+
+// kernel6x16Int8 is the int8-panel microkernel; see kernel_go.go.
+func kernel6x16Int8(a *float32, b *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	if useAVX2 {
+		kernel6x16AVX2I(a, b, k, c, ldc, bias, mode)
+		return
+	}
+	kernel6x16PortableInt8(a, b, k, c, ldc, bias, mode)
+}
+
+// kernel12x32Int8 is the int8-panel wide kernel; see kernel_go.go.
+func kernel12x32Int8(a0, a1 *float32, b0, b1 *int8, k int, c *float32, ldc int, bias *float32, mode int) {
+	if useAVX512 {
+		kernel12x32AVX512I(a0, a1, b0, b1, k, c, ldc, bias, mode)
+		return
+	}
+	kernel12x32PortableInt8(a0, a1, b0, b1, k, c, ldc, bias, mode)
+}
+
+// gemvPanelsInt8 is gemvPanels for int8 panels.
+func gemvPanelsInt8(a *float32, b *int8, panelStride, k, panels int, out *[4 * nr]float32) {
+	switch {
+	case !useAVX2:
+		gemvGoInt8(a, b, panelStride, k, panels, out[:])
+	case panels == 4:
+		gemv4AVX2I(a, b, panelStride, k, out)
+	default:
+		gemv1AVX2I(a, b, panelStride, k, (*[nr]float32)(out[:nr]))
 	}
 }

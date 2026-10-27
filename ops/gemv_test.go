@@ -7,7 +7,6 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/mhpenta/infer/internal/half"
 	"github.com/mhpenta/infer/tensor"
 )
 
@@ -21,16 +20,20 @@ func TestGemvMatchesGemmExactly(t *testing.T) {
 		wide = wide || forceWide
 		for _, n := range []int{1, 15, 16, 17, 64, 65, 100, 513} {
 			for _, k := range []int{1, 2, 3, 255, 256, 257, 600} {
-				for _, usePanels := range []string{"f32", "f16"} {
-					name := fmt.Sprintf("wide=%v/n%d_k%d_%s", wide, n, k, usePanels)
-					w := tensor.New(n, k)
-					for i, h := range randomHalves(r, n*k) {
-						w.Data[i] = half.ToFloat32(h)
-					}
-					p := Pack(w)
-					if usePanels == "f16" {
+				for _, format := range []panelFormat{formatF32, formatF16, formatBF16, formatInt8} {
+					name := fmt.Sprintf("wide=%v/n%d_k%d_%v", wide, n, k, format)
+					var w *tensor.Tensor
+					p := (*Packed)(nil)
+					switch format {
+					case formatF32:
+						w = narrowWeights(r, formatF16, n, k)
+						p = Pack(w)
+					case formatInt8:
+						p = PackInt8(tensor.FromData(randomSlice(r, n*k), n, k))
+					default:
+						w = narrowWeights(r, format, n, k)
 						var err error
-						if p, err = PackHalf(w); err != nil {
+						if p, err = packNarrowAs(format, w); err != nil {
 							t.Fatal(err)
 						}
 					}

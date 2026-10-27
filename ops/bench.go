@@ -61,24 +61,35 @@ func KernelGFLOPS(d time.Duration) map[string]float64 {
 }
 
 // MatMulGFLOPS times a single-threaded product of an [m, k] matrix with a
-// packed [k, n] one, as Linear runs it, with "f32" or "f16" panels.
+// packed [k, n] one, as Linear runs it, with "f32", "f16", "bf16" or "int8"
+// panels.
 func MatMulGFLOPS(d time.Duration, m, n, k int, panels string) float64 {
 	r := rand.New(rand.NewPCG(3, 4))
 	a := randomFloats(r, m*k)
 	wt := tensor.New(n, k)
-	for i, h := range randomHalves(r, n*k) {
-		wt.Data[i] = halfToFloat(h)
-	}
-	w := Pack(wt)
+	var w *Packed
+	var err error
 	switch panels {
-	case "f32":
-	case "f16":
-		var err error
-		if w, err = PackHalf(wt); err != nil {
-			panic(err)
+	case "f32", "f16":
+		for i, h := range randomHalves(r, n*k) {
+			wt.Data[i] = halfToFloat(h)
 		}
+		if w = Pack(wt); panels == "f16" {
+			w, err = PackHalf(wt)
+		}
+	case "bf16":
+		for i, h := range randomBF16(r, n*k) {
+			wt.Data[i] = math.Float32frombits(uint32(h) << 16)
+		}
+		w, err = PackBF16(wt)
+	case "int8":
+		copy(wt.Data, randomFloats(r, n*k))
+		w = PackInt8(wt)
 	default:
 		panic("ops.MatMulGFLOPS: unknown panels " + panels)
+	}
+	if err != nil {
+		panic(err)
 	}
 	c := make([]float32, m*n)
 	return measure(d, func() { gemm(m, a, k, w, nil, c, n, 1) }, float64(2*m*n*k))
@@ -113,6 +124,30 @@ func randomHalves(r *rand.Rand, n int) []uint16 {
 }
 
 func halfToFloat(h uint16) float32 { return half.ToFloat32(h) }
+
+// randomBF16 returns n random bf16 values (bits): normal draws truncated to
+// bf16, with every 16th scaled far below fp16's range, as real weights have.
+func randomBF16(r *rand.Rand, n int) []uint16 {
+	s := make([]uint16, n)
+	for i := range s {
+		v := float32(r.NormFloat64())
+		if i%16 == 0 {
+			v *= 1e-12
+		}
+		s[i] = uint16(math.Float32bits(v) >> 16)
+	}
+	return s
+}
+
+// randomInt8 returns n random int8 values across the whole range a
+// quantized panel uses, [-127, 127].
+func randomInt8(r *rand.Rand, n int) []int8 {
+	s := make([]int8, n)
+	for i := range s {
+		s[i] = int8(r.IntN(255) - 127)
+	}
+	return s
+}
 
 func randomFloats(r *rand.Rand, n int) []float32 {
 	s := make([]float32, n)

@@ -9,13 +9,16 @@ import (
 	"github.com/mhpenta/infer/tensor"
 )
 
-// refAttentionArgs is attention with bias and a causal mask, from the
-// definition, in float64, on dense [seq, hidden] and [kvSeq, hidden] inputs.
+// refAttentionArgs is attention with bias, a causal mask and grouped
+// key/value heads, from the definition, in float64, on dense [seq, hidden]
+// queries and [kvSeq, kvHeads·headDim] keys and values.
 func refAttentionArgs(q, k, v []float32, seq, kvSeq, hidden int, args AttentionArgs) []float64 {
 	dh := hidden / args.Heads
+	kvHidden := args.kvHeads() * dh
+	group := args.Heads / args.kvHeads()
 	out := make([]float64, seq*hidden)
 	for h := range args.Heads {
-		off := h * dh
+		off, kvOff := h*dh, (h/group)*dh
 		for i := range seq {
 			scores := make([]float64, kvSeq)
 			peak := math.Inf(-1)
@@ -25,7 +28,7 @@ func refAttentionArgs(q, k, v []float32, seq, kvSeq, hidden int, args AttentionA
 					continue
 				}
 				for d := range dh {
-					scores[j] += float64(q[i*hidden+off+d]) * float64(k[j*hidden+off+d])
+					scores[j] += float64(q[i*hidden+off+d]) * float64(k[j*kvHidden+kvOff+d])
 				}
 				scores[j] *= float64(args.Scale)
 				if args.Bias != nil {
@@ -40,7 +43,7 @@ func refAttentionArgs(q, k, v []float32, seq, kvSeq, hidden int, args AttentionA
 			}
 			for j := range kvSeq {
 				for d := range dh {
-					out[i*hidden+off+d] += scores[j] / sum * float64(v[j*hidden+off+d])
+					out[i*hidden+off+d] += scores[j] / sum * float64(v[j*kvHidden+kvOff+d])
 				}
 			}
 		}
@@ -171,4 +174,93 @@ func TestKVCacheMatchesAttentionStrided(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGroupedQueryAttention checks attention with fewer key/value heads than
+// query heads against the float64 definition, and bit for bit against
+// ordinary attention on the key/value heads copied out to every query head:
+// per head (several queries) and with a group's queries batched (one query),
+// directly and through a KVCache.
+func TestGroupedQueryAttention(t *testing.T) {
+	r := rand.New(rand.NewPCG(55, 56))
+	tests := []struct {
+		heads, kvHeads, headDim, seq, kvSeq, offset int
+		causal, bias                                bool
+	}{
+		{16, 2, 16, 1, 9, 8, true, true}, // a decoding step, MiniCPM5's grouping
+		{16, 2, 16, 1, 9, 0, false, false},
+		{16, 2, 16, 6, 6, 0, true, false}, // a prompt
+		{8, 2, 8, 3, 11, 8, true, true},   // several new positions after a cache
+		{4, 1, 32, 1, 5, 4, true, false},  // multi-query attention
+		{4, 4, 8, 1, 5, 4, true, true},    // no grouping
+	}
+	for _, tt := range tests {
+		name := fmt.Sprintf("h%d_kv%d_seq%d_kvseq%d", tt.heads, tt.kvHeads, tt.seq, tt.kvSeq)
+		t.Run(name, func(t *testing.T) {
+			hidden, kvHidden := tt.heads*tt.headDim, tt.kvHeads*tt.headDim
+			q := randomSlice(r, tt.seq*hidden)
+			k, v := randomSlice(r, tt.kvSeq*kvHidden), randomSlice(r, tt.kvSeq*kvHidden)
+			args := AttentionArgs{Heads: tt.heads, KVHeads: tt.kvHeads, Scale: 0.25, Causal: tt.causal, Offset: tt.offset}
+			if tt.bias {
+				args.Bias = randomSlice(r, tt.heads*tt.seq*tt.kvSeq)
+			}
+			got := make([]float32, tt.seq*hidden)
+			AttentionStrided(got, hidden, q, hidden, k, kvHidden, v, kvHidden, tt.seq, tt.kvSeq, hidden, args)
+			for i, w := range refAttentionArgs(q, k, v, tt.seq, tt.kvSeq, hidden, args) {
+				if math.Abs(float64(got[i])-w) > 1e-5*(1+math.Abs(w)) {
+					t.Fatalf("out[%d] = %g, want %g", i, got[i], w)
+				}
+			}
+
+			// The same keys and values, one copy per query head.
+			group := tt.heads / tt.kvHeads
+			kFull, vFull := make([]float32, tt.kvSeq*hidden), make([]float32, tt.kvSeq*hidden)
+			for j := range tt.kvSeq {
+				for h := range tt.heads {
+					src := j*kvHidden + (h/group)*tt.headDim
+					copy(kFull[j*hidden+h*tt.headDim:], k[src:src+tt.headDim])
+					copy(vFull[j*hidden+h*tt.headDim:], v[src:src+tt.headDim])
+				}
+			}
+			full := args
+			full.KVHeads = 0
+			want := make([]float32, tt.seq*hidden)
+			AttentionStrided(want, hidden, q, hidden, kFull, hidden, vFull, hidden, tt.seq, tt.kvSeq, hidden, full)
+			if !bitsEqual(got, want) {
+				t.Fatal("grouped attention differs from attention on copied heads")
+			}
+
+			cache := NewKVCache(tt.kvHeads, tt.headDim, 1)
+			for j := range tt.kvSeq {
+				cache.Append(k[j*kvHidden:], kvHidden, v[j*kvHidden:], kvHidden, 1)
+			}
+			cached := make([]float32, tt.seq*hidden)
+			cache.Attend(cached, hidden, q, hidden, tt.seq, args)
+			if !bitsEqual(cached, want) {
+				t.Fatal("grouped attention over a KVCache differs")
+			}
+		})
+	}
+}
+
+func TestGroupedQueryAttentionRejectsBadHeads(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("16 query heads over 3 key/value heads did not panic")
+		}
+	}()
+	out, q, kv := make([]float32, 16*4), make([]float32, 16*4), make([]float32, 3*4)
+	AttentionStrided(out, 64, q, 64, kv, 12, kv, 12, 1, 1, 64, AttentionArgs{Heads: 16, KVHeads: 3, Scale: 1})
+}
+
+func bitsEqual(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if math.Float32bits(a[i]) != math.Float32bits(b[i]) {
+			return false
+		}
+	}
+	return true
 }

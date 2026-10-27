@@ -1,7 +1,9 @@
 package ops
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -47,17 +49,44 @@ const (
 // Packed is the right-hand operand of a product, n output columns over a
 // shared dimension k, laid out for the microkernel: panel p holds columns
 // [p*nr, p*nr+nr) with element (kk, jj) at data[p*k*nr + kk*nr + jj]. The
-// last panel is zero-padded. Weights stored as fp16 can keep their panels in
-// fp16 (half, same layout; see PackHalf), halving what a product streams.
+// last panel is zero-padded. Weights stored as fp16 or bf16 can keep their
+// panels in that 16-bit format (narrow, same layout; see PackHalf and
+// PackBF16), halving what a product streams, and any weights can be
+// quantized to int8 panels (quant, same layout; see PackInt8), quartering it.
 type Packed struct {
-	n, k int
-	data []float32 // float32 panels, nil when half is used
-	half []uint16  // fp16 panels
+	n, k   int
+	data   []float32   // float32 panels, nil when narrow or quant is used
+	narrow []uint16    // 16-bit panels, widened to float32 by the kernels
+	quant  []int8      // int8 panels, widened to float32 by the kernels
+	scale  []float32   // with quant: column j of the product is scaled by scale[j]
+	format panelFormat // what narrow or quant holds
 
 	// stride, when set, is the distance between panels in values; otherwise
 	// panels are dense (k·nr apart). A larger stride leaves room for k to
 	// grow in place, as a cache of attention values does.
 	stride int
+}
+
+// panelFormat is the storage of a Packed's panels.
+type panelFormat uint8
+
+const (
+	formatF32  panelFormat = iota // data
+	formatF16                     // narrow holds IEEE half precision
+	formatBF16                    // narrow holds bfloat16, the top half of a float32
+	formatInt8                    // quant holds int8, with a float32 scale per column
+)
+
+func (f panelFormat) String() string {
+	switch f {
+	case formatF16:
+		return "fp16"
+	case formatBF16:
+		return "bf16"
+	case formatInt8:
+		return "int8"
+	}
+	return "float32"
 }
 
 // panelStride returns the distance between consecutive panels, in values.
@@ -86,23 +115,121 @@ func Pack(w *tensor.Tensor) *Packed {
 // bit-identical to Pack's while reading half the memory. It fails on a value
 // that would round.
 func PackHalf(w *tensor.Tensor) (*Packed, error) {
+	return packNarrow(w, formatF16, half.FromFloat32Exact)
+}
+
+// PackBF16 is Pack with the panels stored as bfloat16. Every value of w must
+// be exactly representable in bf16 (the low 16 bits of its float32 encoding
+// zero), as weights loaded from a BF16 file are; as with PackHalf, products
+// are bit-identical to Pack's. It fails on a value that would round.
+func PackBF16(w *tensor.Tensor) (*Packed, error) {
+	return packNarrow(w, formatBF16, bf16FromFloat32Exact)
+}
+
+// bf16FromFloat32Exact returns f as bf16 bits, and whether that is exact.
+func bf16FromFloat32Exact(f float32) (uint16, bool) {
+	bits := math.Float32bits(f)
+	return uint16(bits >> 16), bits&0xffff == 0
+}
+
+// packNarrow packs w as Pack does, converting each value with exact. Panels
+// are independent, so they are packed in parallel, each written in order.
+func packNarrow(w *tensor.Tensor, format panelFormat, exact func(float32) (uint16, bool)) (*Packed, error) {
 	n, k := w.Rows(), w.Cols()
-	p := &Packed{n: n, k: k, half: make([]uint16, packedSize(n, k))}
-	for j := range n {
-		base := (j/nr)*k*nr + j%nr
-		for kk, v := range w.Row(j) {
-			h, ok := half.FromFloat32Exact(v)
-			if !ok {
-				return nil, fmt.Errorf("ops.PackHalf: w[%d][%d] = %g is not exact in fp16", j, kk, v)
+	p := &Packed{n: n, k: k, narrow: make([]uint16, packedSize(n, k)), format: format}
+	panels := (n + nr - 1) / nr
+	errs := make([]error, panels)
+	forEach(panels, runtime.GOMAXPROCS(0), func(pi int) {
+		dst := p.narrow[pi*k*nr : (pi+1)*k*nr]
+		for jj := range min(nr, n-pi*nr) {
+			j := pi*nr + jj
+			for kk, v := range w.Row(j) {
+				h, ok := exact(v)
+				if !ok {
+					errs[pi] = fmt.Errorf("ops: w[%d][%d] = %g is not exact in %v", j, kk, v, format)
+					return
+				}
+				dst[kk*nr+jj] = h
 			}
-			p.half[base+kk*nr] = h
 		}
+	})
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
 	}
 	return p, nil
 }
 
+// PackInt8 is Pack with w quantized to int8: each row j of w (output column
+// j of the product) is stored as integers q in [-127, 127] with one float32
+// scale, max|w[j]|/127, so that w[j][kk] ≈ scale[j]·q[kk], to within half a
+// scale step. The kernels widen q to float32 and sum the products exactly
+// as for float32 panels; each output is then scaled once (and the bias
+// added), so a product is bit-identical to Pack's on the integers q followed
+// by that per-column step. Panels read a quarter of float32's memory and
+// half of bf16's.
+func PackInt8(w *tensor.Tensor) *Packed {
+	n, k := w.Rows(), w.Cols()
+	p := &Packed{n: n, k: k, quant: make([]int8, packedSize(n, k)), scale: make([]float32, n), format: formatInt8}
+	forEach((n+nr-1)/nr, runtime.GOMAXPROCS(0), func(pi int) {
+		dst := p.quant[pi*k*nr : (pi+1)*k*nr]
+		q := make([]int8, k)
+		for jj := range min(nr, n-pi*nr) {
+			j := pi*nr + jj
+			p.scale[j] = quantizeRow(q, w.Row(j))
+			for kk, v := range q {
+				dst[kk*nr+jj] = v
+			}
+		}
+	})
+	return p
+}
+
+// quantizeRow sets q to row in units of its returned scale, max|row|/127,
+// rounding to the nearest integer. A row of zeros gets scale 0.
+func quantizeRow(q []int8, row []float32) float32 {
+	var peak float32
+	for _, v := range row {
+		peak = max(peak, float32(math.Abs(float64(v))))
+	}
+	if peak == 0 {
+		clear(q)
+		return 0
+	}
+	scale := peak / 127
+	for kk, v := range row {
+		q[kk] = int8(max(-127, min(127, math.Round(float64(v/scale)))))
+	}
+	return scale
+}
+
+// scaleColumns finishes an int8 product over columns [j0, j1) of rows i0 to
+// i1: c = c·scale (+ bias). The explicit float32 conversion keeps the
+// multiply and the add separately rounded on every architecture.
+func scaleColumns(c []float32, ldc, i0, i1, j0, j1 int, scale, bias []float32) {
+	for i := i0; i < i1; i++ {
+		row := c[i*ldc+j0 : i*ldc+j1]
+		s := scale[j0:j1]
+		if bias == nil {
+			for jj, v := range row {
+				row[jj] = v * s[jj]
+			}
+			continue
+		}
+		b := bias[j0:j1]
+		for jj, v := range row {
+			row[jj] = float32(v*s[jj]) + b[jj]
+		}
+	}
+}
+
+// Int8 reports whether the panels are quantized to int8.
+func (p *Packed) Int8() bool { return p.format == formatInt8 }
+
 // Half reports whether the panels are stored as fp16.
-func (p *Packed) Half() bool { return p.half != nil }
+func (p *Packed) Half() bool { return p.format == formatF16 }
+
+// BF16 reports whether the panels are stored as bf16.
+func (p *Packed) BF16() bool { return p.format == formatBF16 }
 
 // packT packs b holding n rows of k values (row j at b[j*ldb]), for a·bᵀ.
 func packT(b []float32, n, k, ldb int) *Packed {
@@ -222,6 +349,11 @@ func gemm(m int, a []float32, lda int, b *Packed, bias, c []float32, ldc int, wo
 		gemv(a[:k], b, bias, c[:n], workers)
 		return
 	}
+	// An int8 product sums without the bias, which is added after scaling.
+	kbias := bias
+	if b.quant != nil {
+		kbias = nil
+	}
 
 	// Pack all of a up front: every column block reuses the same strips, and
 	// packing costs m·k against the product's m·n·k.
@@ -233,7 +365,11 @@ func gemm(m int, a []float32, lda int, b *Packed, bias, c []float32, ldc int, wo
 	blocksN := (n + nc - 1) / nc
 	forEach(blocksM*blocksN, workers, func(t int) {
 		i0, j0 := (t/blocksN)*mc, (t%blocksN)*nc
-		gemmBlock(*buf, b, bias, c, ldc, i0, min(i0+mc, m), j0, min(j0+nc, n))
+		i1, j1 := min(i0+mc, m), min(j0+nc, n)
+		gemmBlock(*buf, b, kbias, c, ldc, i0, i1, j0, j1)
+		if b.quant != nil {
+			scaleColumns(c, ldc, i0, i1, j0, j1, b.scale, bias)
+		}
 	})
 }
 
@@ -294,7 +430,7 @@ func gemv(a []float32, b *Packed, bias, c []float32, workers int) {
 			mode := addC
 			if k0 == 0 {
 				mode = storeC
-				if bias != nil {
+				if bias != nil && b.quant == nil {
 					mode = storeBiasC
 				}
 			}
@@ -303,9 +439,12 @@ func gemv(a []float32, b *Packed, bias, c []float32, workers int) {
 				if p+4 > panels {
 					count = 1
 				}
-				if b.half != nil {
-					gemvPanelsHalf(&a[k0], &b.half[p*stride+k0*nr], stride, depth, count, &out)
-				} else {
+				switch {
+				case b.quant != nil:
+					gemvPanelsInt8(&a[k0], &b.quant[p*stride+k0*nr], stride, depth, count, &out)
+				case b.narrow != nil:
+					gemvPanelsNarrow(b.format, &a[k0], &b.narrow[p*stride+k0*nr], stride, depth, count, &out)
+				default:
 					gemvPanels(&a[k0], &b.data[p*stride+k0*nr], stride, depth, count, &out)
 				}
 				j0 := p * nr
@@ -322,6 +461,9 @@ func gemv(a []float32, b *Packed, bias, c []float32, workers int) {
 				}
 				p += count
 			}
+		}
+		if b.quant != nil {
+			scaleColumns(c, 0, 0, 1, g0*4*nr, min(g1*4*nr, n), b.scale, bias)
 		}
 	})
 }
@@ -342,26 +484,30 @@ func (t *tiler) strip(i int) *float32 {
 	return &t.packed[(i/mr)*t.b.k*mr+t.k0*mr]
 }
 
-// half reports whether b's panels are fp16, read directly by the kernels.
-func (t *tiler) half() bool {
-	return t.b.half != nil
-}
-
 // panel returns the kc slice of b's float32 panel holding column j (a
 // multiple of nr).
 func (t *tiler) panel(j int) *float32 {
 	return &t.b.data[(j/nr)*t.b.panelStride()+t.k0*nr]
 }
 
-// panelHalf is panel for fp16 panels.
-func (t *tiler) panelHalf(j int) *uint16 {
-	return &t.b.half[(j/nr)*t.b.panelStride()+t.k0*nr]
+// panelNarrow is panel for 16-bit panels.
+func (t *tiler) panelNarrow(j int) *uint16 {
+	return &t.b.narrow[(j/nr)*t.b.panelStride()+t.k0*nr]
+}
+
+// panelInt8 is panel for int8 panels.
+func (t *tiler) panelInt8(j int) *int8 {
+	return &t.b.quant[(j/nr)*t.b.panelStride()+t.k0*nr]
 }
 
 // kernel runs the 6×16 kernel for the panel storage in use.
 func (t *tiler) kernel(i, j int, c *float32, ldc int, bias *float32, mode int) {
-	if t.half() {
-		kernel6x16Half(t.strip(i), t.panelHalf(j), t.depth, c, ldc, bias, mode)
+	if t.b.quant != nil {
+		kernel6x16Int8(t.strip(i), t.panelInt8(j), t.depth, c, ldc, bias, mode)
+		return
+	}
+	if t.b.narrow != nil {
+		kernel6x16Narrow(t.b.format, t.strip(i), t.panelNarrow(j), t.depth, c, ldc, bias, mode)
 		return
 	}
 	kernel6x16(t.strip(i), t.panel(j), t.depth, c, ldc, bias, mode)
@@ -374,8 +520,12 @@ func (t *tiler) wide(i, j int) {
 		biasRow = &t.bias[j]
 	}
 	c := &t.c[i*t.ldc+j]
-	if t.half() {
-		kernel12x32Half(t.strip(i), t.strip(i+mr), t.panelHalf(j), t.panelHalf(j+nr), t.depth, c, t.ldc, biasRow, t.mode)
+	if t.b.quant != nil {
+		kernel12x32Int8(t.strip(i), t.strip(i+mr), t.panelInt8(j), t.panelInt8(j+nr), t.depth, c, t.ldc, biasRow, t.mode)
+		return
+	}
+	if t.b.narrow != nil {
+		kernel12x32Narrow(t.b.format, t.strip(i), t.strip(i+mr), t.panelNarrow(j), t.panelNarrow(j+nr), t.depth, c, t.ldc, biasRow, t.mode)
 		return
 	}
 	kernel12x32(t.strip(i), t.strip(i+mr), t.panel(j), t.panel(j+nr), t.depth, c, t.ldc, biasRow, t.mode)
