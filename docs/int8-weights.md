@@ -116,6 +116,21 @@ and int8 by instructions. int8 now decodes only about 1.08× faster than bf16
 there: 20.6 against 22.2 ms per token. The int8 one-row kernel streams 64 GB/s
 of int8 from DRAM, and bf16 96 GB/s of bf16.
 
+## On the GPU
+
+With `Options.Int8` on Apple silicon, the model runs on the GPU by default
+(see [accelerator-plan.md](accelerator-plan.md), step 4).
+`ops.QuantizeInt8` gives the same integers and scales as `PackInt8`,
+row-major. The GPU kernels widen int8 as they widen bf16, then scale each
+output once its sum is done, the definition above. `TestInt8MatchesBF16`
+runs on both devices, and on Metal it reproduces the table above to the
+digit.
+
+There, unlike on NEON, int8 is worth it. MiniCPM5-1B decodes at 6.1 against
+8.4 ms/token in bf16 (1.37×), and MiniCPM5-2B at 13.1 against 21.6
+ms/token (1.65×, 76 tokens/s). Widening costs the GPU little next to the
+memory traffic it saves.
+
 ## Next: int8 activations with integer dot products
 
 The fast path on ARM, and the one llama.cpp uses for its Q8_0 format,

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/mhpenta/infer/accel"
 	"github.com/mhpenta/infer/internal/golden"
 	"github.com/mhpenta/infer/ops"
 	"github.com/mhpenta/infer/pool"
@@ -41,14 +42,10 @@ func mxbaiBinary(t *testing.T, m *Model, tok *wordpiece.Tokenizer, text string) 
 	return v, quant.Binary(v)
 }
 
-func loadMxbai(t *testing.T) (*Model, *wordpiece.Tokenizer) {
+func loadMxbai(t *testing.T, device string) (*Model, *wordpiece.Tokenizer) {
 	t.Helper()
 	dir := golden.ModelDir(t, "INFER_MXBAI_DIR", "mxbai-embed-large-v1")
-	model, err := Load(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { model.Close() })
+	model := loadOn(t, dir, device)
 	tok, err := wordpiece.LoadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +57,13 @@ func TestMxbaiMatchesPython(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mxbai is large; skipped with -short")
 	}
-	model, tok := loadMxbai(t)
+	for _, device := range testDevices(t) {
+		t.Run(device, func(t *testing.T) { checkMxbai(t, device) })
+	}
+}
+
+func checkMxbai(t *testing.T, device string) {
+	model, tok := loadMxbai(t, device)
 	want, err := safetensors.Open(golden.Path("mxbai_model.safetensors"))
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +121,13 @@ func TestMxbaiBinaryMatchesPython(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mxbai is large; skipped with -short")
 	}
-	model, tok := loadMxbai(t)
+	for _, device := range testDevices(t) {
+		t.Run(device, func(t *testing.T) { checkMxbaiBinary(t, device) })
+	}
+}
+
+func checkMxbaiBinary(t *testing.T, device string) {
+	model, tok := loadMxbai(t, device)
 	var cases []struct {
 		Text   string `json:"text"`
 		Binary []int8 `json:"binary"`
@@ -150,8 +159,14 @@ func relDiff(got, want []float32) float64 {
 }
 
 func BenchmarkMxbaiForward(b *testing.B) {
+	for _, device := range testDevices(b) {
+		b.Run(device, func(b *testing.B) { benchMxbai(b, device) })
+	}
+}
+
+func benchMxbai(b *testing.B, device string) {
 	dir := golden.ModelDir(b, "INFER_MXBAI_DIR", "mxbai-embed-large-v1")
-	model, err := Load(dir)
+	model, err := LoadWith(dir, Options{Device: device})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -183,10 +198,10 @@ func TestMxbaiHalfPanelsIdentical(t *testing.T) {
 	if !ops.HalfPanels() {
 		t.Skip("no fp16-panel SIMD kernels in this build")
 	}
-	halfModel, tok := loadMxbai(t)
+	halfModel, tok := loadMxbai(t, accel.CPU)
 	saved := useHalfPanels
 	useHalfPanels = func() bool { return false }
-	floatModel, _ := loadMxbai(t)
+	floatModel, _ := loadMxbai(t, accel.CPU)
 	useHalfPanels = saved
 
 	// From a short query to the 512-token golden case, so both the 6×16 and

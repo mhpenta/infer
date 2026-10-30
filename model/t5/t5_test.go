@@ -1,12 +1,17 @@
 package t5
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/mhpenta/infer/accel"
 	"github.com/mhpenta/infer/internal/golden"
+	"github.com/mhpenta/infer/metal"
 	"github.com/mhpenta/infer/safetensors"
 )
 
@@ -21,11 +26,38 @@ type modelCase struct {
 	Output    string `json:"output"`
 }
 
-func loadT5(t *testing.T) (*Model, []modelCase, *safetensors.File) {
-	t.Helper()
-	model, err := Load(golden.ModelDir(t, "INFER_T5_DIR", "t5-small"))
+// testDevices returns the devices to test on: the CPU, and Metal when this
+// machine has it (or must, with INFER_REQUIRE_METAL=1).
+func testDevices(t testing.TB) []string {
+	_, err := accel.OpenMetal()
+	if errors.Is(err, metal.ErrUnavailable) && os.Getenv("INFER_REQUIRE_METAL") != "1" {
+		return []string{accel.CPU}
+	}
 	if err != nil {
 		t.Fatal(err)
+	}
+	return []string{accel.CPU, accel.Metal}
+}
+
+// eachDevice runs check on t5-small loaded on each device, with its golden
+// cases and reference tensors.
+func eachDevice(t *testing.T, check func(t *testing.T, model *Model, cases []modelCase, want *safetensors.File)) {
+	for _, device := range testDevices(t) {
+		t.Run(device, func(t *testing.T) {
+			model, cases, want := loadT5(t, device)
+			check(t, model, cases, want)
+		})
+	}
+}
+
+func loadT5(t *testing.T, device string) (*Model, []modelCase, *safetensors.File) {
+	t.Helper()
+	model, err := LoadWith(golden.ModelDir(t, "INFER_T5_DIR", "t5-small"), Options{Device: device})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if device != accel.Auto && !strings.HasPrefix(model.Device(), device) {
+		t.Fatalf("loaded on %s, want %s", model.Device(), device)
 	}
 	t.Cleanup(func() { model.Close() })
 	var cases []modelCase
@@ -59,52 +91,54 @@ func TestRelativeBucketMatchesPython(t *testing.T) {
 }
 
 func TestT5SmallMatchesPython(t *testing.T) {
-	model, cases, want := loadT5(t)
-	for i, c := range cases {
-		t.Run(fmt.Sprintf("case%d_%d_in_%d_out", i, len(c.InputIDs), len(c.OutputIDs)-1), func(t *testing.T) {
-			enc, err := model.EncoderHiddenStates(c.InputIDs)
-			if err != nil {
-				t.Fatal(err)
-			}
-			worst := 0.0
-			for j, got := range enc {
-				worst = max(worst, compare(t, want, fmt.Sprintf("case%d.enc.hidden.%d", i, j), got.Data))
-			}
-			// Teacher forcing: the generated sequence minus its last token.
-			dec, logits, err := model.DecoderHiddenStates(enc[len(enc)-1], c.OutputIDs[:len(c.OutputIDs)-1])
-			if err != nil {
-				t.Fatal(err)
-			}
-			for j, got := range dec {
-				worst = max(worst, compare(t, want, fmt.Sprintf("case%d.dec.hidden.%d", i, j), got.Data))
-			}
-			ref, err := want.Tensor(fmt.Sprintf("case%d.dec.logits", i))
-			if err != nil {
-				t.Fatal(err)
-			}
-			worst = max(worst, compareData(t, "logits", logits.Data[:ref.Size()], ref.Data))
-			t.Logf("largest difference from PyTorch: %.2g of a tensor's range", worst)
-			for p := range logits.Rows() {
-				row := logits.Row(p)
-				if got := argmax(row); got != c.OutputIDs[p+1] {
-					t.Fatalf("position %d: argmax %d, want %d", p, got, c.OutputIDs[p+1])
+	eachDevice(t, func(t *testing.T, model *Model, cases []modelCase, want *safetensors.File) {
+		for i, c := range cases {
+			t.Run(fmt.Sprintf("case%d_%d_in_%d_out", i, len(c.InputIDs), len(c.OutputIDs)-1), func(t *testing.T) {
+				enc, err := model.EncoderHiddenStates(c.InputIDs)
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-		})
-	}
+				worst := 0.0
+				for j, got := range enc {
+					worst = max(worst, compare(t, want, fmt.Sprintf("case%d.enc.hidden.%d", i, j), got.Data))
+				}
+				// Teacher forcing: the generated sequence minus its last token.
+				dec, logits, err := model.DecoderHiddenStates(enc[len(enc)-1], c.OutputIDs[:len(c.OutputIDs)-1])
+				if err != nil {
+					t.Fatal(err)
+				}
+				for j, got := range dec {
+					worst = max(worst, compare(t, want, fmt.Sprintf("case%d.dec.hidden.%d", i, j), got.Data))
+				}
+				ref, err := want.Tensor(fmt.Sprintf("case%d.dec.logits", i))
+				if err != nil {
+					t.Fatal(err)
+				}
+				worst = max(worst, compareData(t, "logits", logits.Data[:ref.Size()], ref.Data))
+				t.Logf("largest difference from PyTorch: %.2g of a tensor's range", worst)
+				for p := range logits.Rows() {
+					row := logits.Row(p)
+					if got := argmax(row); got != c.OutputIDs[p+1] {
+						t.Fatalf("position %d: argmax %d, want %d", p, got, c.OutputIDs[p+1])
+					}
+				}
+			})
+		}
+	})
 }
 
 func TestGenerateUncachedMatchesPython(t *testing.T) {
-	model, cases, _ := loadT5(t)
-	for i, c := range cases {
-		got, err := model.generateUncached(c.InputIDs, 64)
-		if err != nil {
-			t.Fatal(err)
+	eachDevice(t, func(t *testing.T, model *Model, cases []modelCase, want *safetensors.File) {
+		for i, c := range cases {
+			got, err := model.generateUncached(c.InputIDs, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := c.OutputIDs[1:]; !slices.Equal(got, want) {
+				t.Errorf("case %d: generated %v\nwant %v", i, got, want)
+			}
 		}
-		if want := c.OutputIDs[1:]; !slices.Equal(got, want) {
-			t.Errorf("case %d: generated %v\nwant %v", i, got, want)
-		}
-	}
+	})
 }
 
 // compare checks got against the named reference tensor and returns the
@@ -149,42 +183,51 @@ func argmax(x []float32) int {
 // against PyTorch (which also uses a cache), including a case that runs to
 // the token limit without reaching </s>.
 func TestGenerateMatchesPython(t *testing.T) {
-	model, cases, _ := loadT5(t)
-	for i, c := range cases {
-		got, err := model.Generate(c.InputIDs, 64)
-		if err != nil {
-			t.Fatal(err)
+	eachDevice(t, func(t *testing.T, model *Model, cases []modelCase, want *safetensors.File) {
+		for i, c := range cases {
+			got, err := model.Generate(c.InputIDs, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := c.OutputIDs[1:]; !slices.Equal(got, want) {
+				t.Errorf("case %d: generated %v\nwant %v", i, got, want)
+			}
 		}
-		if want := c.OutputIDs[1:]; !slices.Equal(got, want) {
-			t.Errorf("case %d: generated %v\nwant %v", i, got, want)
-		}
-	}
+	})
 }
 
 // TestCachedStepsMatchTeacherForcing compares the cached decoder's logits,
 // step by step, with the reference logits from one teacher-forced pass.
 func TestCachedStepsMatchTeacherForcing(t *testing.T) {
-	model, cases, want := loadT5(t)
-	for i, c := range cases {
-		enc, err := model.Encode(c.InputIDs)
-		if err != nil {
-			t.Fatal(err)
+	eachDevice(t, func(t *testing.T, model *Model, cases []modelCase, want *safetensors.File) {
+		for i, c := range cases {
+			enc, err := model.Encode(c.InputIDs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref, err := want.Tensor(fmt.Sprintf("case%d.dec.logits", i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			st, err := model.newDecoderState(enc, 1) // starts small, so the cache must grow
+			if err != nil {
+				t.Fatal(err)
+			}
+			vocab := ref.Cols()
+			for p := range ref.Rows() {
+				got, err := st.step(c.OutputIDs[p])
+				if err != nil {
+					t.Fatal(err)
+				}
+				compareData(t, fmt.Sprintf("case %d step %d", i, p), got, ref.Data[p*vocab:(p+1)*vocab])
+			}
+			st.release()
 		}
-		ref, err := want.Tensor(fmt.Sprintf("case%d.dec.logits", i))
-		if err != nil {
-			t.Fatal(err)
-		}
-		st := model.newDecoderState(enc, 1) // starts small, so the cache must grow
-		vocab := ref.Cols()
-		for p := range ref.Rows() {
-			got := st.step(c.OutputIDs[p])
-			compareData(t, fmt.Sprintf("case %d step %d", i, p), got, ref.Data[p*vocab:(p+1)*vocab])
-		}
-	}
+	})
 }
 
 func TestGenerateRejectsBadInput(t *testing.T) {
-	model, _, _ := loadT5(t)
+	model, _, _ := loadT5(t, accel.Auto)
 	for _, ids := range [][]int{nil, {-1, 1}, {model.Config.VocabSize}} {
 		if _, err := model.Generate(ids, 4); err == nil {
 			t.Errorf("Generate(%v) succeeded, want an error", ids)
@@ -193,7 +236,13 @@ func TestGenerateRejectsBadInput(t *testing.T) {
 }
 
 func BenchmarkGenerate(b *testing.B) {
-	model, err := Load(golden.ModelDir(b, "INFER_T5_DIR", "t5-small"))
+	for _, device := range testDevices(b) {
+		b.Run(device, func(b *testing.B) { benchGenerate(b, device) })
+	}
+}
+
+func benchGenerate(b *testing.B, device string) {
+	model, err := LoadWith(golden.ModelDir(b, "INFER_T5_DIR", "t5-small"), Options{Device: device})
 	if err != nil {
 		b.Fatal(err)
 	}

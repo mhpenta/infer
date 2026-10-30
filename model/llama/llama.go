@@ -10,6 +10,10 @@
 // same as with float32 weights), which halves memory and the bandwidth each
 // generated token needs. LoadWith can instead quantize the weights to int8
 // (Options.Int8), halving them again at a small, measured cost in accuracy.
+//
+// On Apple silicon the model can run on the GPU instead (Options.Device,
+// metal.go): by default it does when the GPU is available and suits the
+// model.
 package llama
 
 import (
@@ -19,8 +23,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 
+	"github.com/mhpenta/infer/accel"
+	"github.com/mhpenta/infer/metal"
 	"github.com/mhpenta/infer/ops"
 	"github.com/mhpenta/infer/safetensors"
 	"github.com/mhpenta/infer/sample"
@@ -133,6 +140,9 @@ type Model struct {
 	norm   *tensor.Tensor // final RMSNorm weight
 	lmHead *ops.Packed    // output layer [vocab, hidden]
 	rope   *ops.RoPE
+
+	gpu    *gpuModel // the weights on the GPU, when the model runs there
+	device string
 }
 
 type layer struct {
@@ -169,6 +179,14 @@ type Options struct {
 	// precision. The token embeddings keep theirs: generation reads one row
 	// of them per token.
 	Int8 bool
+
+	// Device is where the model runs: accel.CPU, accel.Metal (an Apple
+	// silicon GPU), or accel.Auto. Empty means $INFER_DEVICE, or Auto when
+	// that is unset too. Auto runs on Metal when the GPU is available,
+	// passes its self-check, and suits the model (bf16 weights that fit in
+	// its working set, no Int8), and on the CPU otherwise; asking for Metal
+	// when it doesn't suit is an error.
+	Device string
 }
 
 // Load reads config.json and the weights (model.safetensors, or the shards
@@ -199,11 +217,29 @@ func LoadWith(dir string, opts Options) (*Model, error) {
 	} else if eos != nil {
 		config.EOS = eos
 	}
+	device, err := accel.Resolve(opts.Device)
+	if err != nil {
+		return nil, fmt.Errorf("llama: %w", err)
+	}
 	files, byName, err := openWeights(dir)
 	if err != nil {
 		return nil, fmt.Errorf("llama: %w", err)
 	}
-	m, err := newModel(config, byName, opts)
+	var m *Model
+	if device != accel.CPU {
+		var g *gpuModel
+		if g, err = openGPU(config, byName, opts); err == nil {
+			m = &Model{Config: config, rope: ops.NewRoPE(config.HeadDim, config.RopeTheta), gpu: g,
+				device: fmt.Sprintf("%s (%s)", accel.Metal, g.gpu.Device.Name())}
+		} else if device == accel.Metal {
+			err = fmt.Errorf("cannot run on Metal: %w", err)
+		} else {
+			err = nil // Auto: the CPU, then
+		}
+	}
+	if m == nil && err == nil {
+		m, err = newModel(config, byName, opts)
+	}
 	if err != nil {
 		for _, f := range files {
 			f.Close()
@@ -285,7 +321,7 @@ func openWeights(dir string) ([]*safetensors.File, map[string]*safetensors.File,
 
 func newModel(c Config, byName map[string]*safetensors.File, opts Options) (*Model, error) {
 	l := loader{files: byName, int8: opts.Int8}
-	m := &Model{Config: c, rope: ops.NewRoPE(c.HeadDim, c.RopeTheta)}
+	m := &Model{Config: c, rope: ops.NewRoPE(c.HeadDim, c.RopeTheta), device: accel.CPU}
 	h, ff := c.HiddenSize, c.IntermediateSize
 	for i := range c.NumHiddenLayers {
 		p := fmt.Sprintf("model.layers.%d.", i)
@@ -325,8 +361,15 @@ func newModel(c Config, byName map[string]*safetensors.File, opts Options) (*Mod
 	return m, nil
 }
 
-// Close releases the weight files.
+// Device returns where the model runs: "cpu", or "metal (" and the GPU's
+// name ")".
+func (m *Model) Device() string { return m.device }
+
+// Close releases the weight files and any GPU memory.
 func (m *Model) Close() error {
+	if m.gpu != nil {
+		m.gpu.release()
+	}
 	var errs []error
 	for _, f := range m.files {
 		errs = append(errs, f.Close())
@@ -355,15 +398,27 @@ func (m *Model) HiddenStates(ids []int) ([]*tensor.Tensor, error) {
 		return nil, err
 	}
 	var states []*tensor.Tensor
-	m.newState(len(ids)).forward(ids, func(x *tensor.Tensor) {
+	st := m.newState(len(ids))
+	defer st.release()
+	_, err := st.forward(ids, func(x *tensor.Tensor) {
 		states = append(states, tensor.FromData(slices.Clone(x.Data), x.Shape...))
 	})
-	return states, nil
+	return states, err
 }
 
 // LogitsInto sets out [rows, vocab] to the output layer applied to hidden
-// states y [rows, hidden] (final, normalized outputs).
+// states y [rows, hidden] (final, normalized outputs). On the GPU it panics
+// if the GPU fails.
 func (m *Model) LogitsInto(out, y *tensor.Tensor) {
+	if m.gpu != nil {
+		if out.Rows() != y.Rows() || out.Cols() != m.Config.VocabSize || y.Cols() != m.Config.HiddenSize {
+			panic(fmt.Sprintf("llama.LogitsInto: out is %v, y %v", out.Shape, y.Shape))
+		}
+		if err := m.gpu.logitsInto(m.Config, out, y); err != nil {
+			panic(fmt.Sprintf("llama.LogitsInto: %v", err))
+		}
+		return
+	}
 	ops.MatMulPackedInto(out, y, m.lmHead)
 }
 
@@ -395,36 +450,142 @@ func (m *Model) GenerateWith(ids []int, maxNew int, s *sample.Sampler, fn func(t
 		return err
 	}
 	st := m.newState(len(ids) + maxNew)
-	logits := tensor.New(1, m.Config.VocabSize)
-	seq := slices.Grow(slices.Clone(ids), maxNew)
-	y := st.forward(ids, nil)
+	defer st.release()
+	return st.generate(ids, maxNew, s, fn)
+}
+
+// Session generates after a series of prompts that share beginnings, such
+// as the rounds of one conversation, where each prompt repeats the last one
+// and its reply. Each call reuses the cached keys and values of the longest
+// prefix its prompt shares with the tokens the session has run (the previous
+// prompt and every token generated after it but the last) and runs only the
+// rest. On the CPU, results are bit-identical to Model.GenerateWith on the
+// same prompt: every operation computes a row the same way whichever rows
+// run with it. On the GPU they match within float32 rounding (see
+// metal.go).
+//
+// The cache stays allocated between calls: for Qwen3-1.7B, 112 KB per
+// position (28 layers of 8 key/value heads of 128, keys and values), until
+// Close or, failing that, until the session is garbage collected. A Session
+// is not safe for concurrent use.
+type Session struct {
+	m      *Model
+	st     *state
+	reused int
+}
+
+// NewSession returns a session with nothing cached.
+func (m *Model) NewSession() *Session {
+	return &Session{m: m, st: m.newState(1)}
+}
+
+// GenerateWith is Model.GenerateWith reusing the session's cache.
+func (s *Session) GenerateWith(ids []int, maxNew int, smp *sample.Sampler, fn func(token int, logits []float32) bool) error {
+	if err := s.m.checkIDs(ids); err != nil {
+		return err
+	}
+	n := 0
+	for n < len(s.st.tokens) && n < len(ids) && s.st.tokens[n] == ids[n] {
+		n++
+	}
+	// The last prompt position always runs again: its output gives the
+	// first token's logits.
+	n = min(n, len(ids)-1)
+	s.st.truncate(n)
+	s.reused = n
+	return s.st.generate(ids, maxNew, smp, fn)
+}
+
+// Reused returns how many prompt positions the last GenerateWith took from
+// the cache.
+func (s *Session) Reused() int { return s.reused }
+
+// Close releases the session's cache now, which matters on the GPU, where
+// it holds GPU memory. The session must not be used after.
+func (s *Session) Close() { s.st.release() }
+
+// generate runs the part of prompt not yet in the caches, which hold a
+// prefix of it, then decodes up to maxNew tokens.
+func (st *state) generate(prompt []int, maxNew int, s *sample.Sampler, fn func(token int, logits []float32) bool) error {
+	defer runtime.KeepAlive(st) // the GPU's logits are st's memory
+	seq := slices.Grow(slices.Clone(prompt), maxNew)
+	logits, err := st.next(prompt[len(st.tokens):])
+	if err != nil {
+		return err
+	}
 	for range maxNew {
-		m.LogitsInto(logits, tensor.FromData(y.Row(y.Rows()-1), 1, y.Cols()))
 		var token int
 		if s == nil {
-			token = ops.Argmax(logits.Data)
+			token = ops.Argmax(logits)
 		} else {
-			token = s.Next(logits.Data, seq)
+			token = s.Next(logits, seq)
 		}
 		seq = append(seq, token)
-		if !fn(token, logits.Data) || slices.Contains(m.Config.EOS, token) {
+		if !fn(token, logits) || slices.Contains(st.m.Config.EOS, token) {
 			return nil
 		}
-		y = st.forward([]int{token}, nil)
+		if logits, err = st.next([]int{token}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// state is one sequence being decoded: its position and per-layer caches.
+// next runs ids at the next positions and returns the logits after the
+// last, valid until the next call.
+func (st *state) next(ids []int) ([]float32, error) {
+	if st.gpu != nil {
+		if _, err := st.gpu.run(len(st.tokens), ids, nil, false, true); err != nil {
+			return nil, err
+		}
+		st.tokens = append(st.tokens, ids...)
+		return metal.Slice[float32](st.gpu.logits), nil
+	}
+	y, _ := st.forward(ids, nil)
+	if st.logits == nil {
+		st.logits = tensor.New(1, st.m.Config.VocabSize)
+	}
+	st.m.LogitsInto(st.logits, tensor.FromData(y.Row(y.Rows()-1), 1, y.Cols()))
+	return st.logits.Data, nil
+}
+
+// state is one sequence being decoded: the tokens run so far and the
+// per-layer caches of their keys and values, on the CPU or the GPU.
 type state struct {
-	m      *Model
-	pos    int
-	caches []*ops.KVCache
+	m       *Model
+	tokens  []int
+	caches  []*ops.KVCache
+	logits  *tensor.Tensor // the CPU's last logits
+	gpu     *gpuState
+	cleanup runtime.Cleanup // releases gpu when the state is unreachable
+}
+
+// release frees the state's GPU memory, if any, without waiting for the
+// garbage collector. The state must not be used after.
+func (st *state) release() {
+	if st.gpu != nil {
+		st.cleanup.Stop()
+		st.gpu.release()
+		st.gpu = nil
+	}
+}
+
+// truncate drops every position from n on.
+func (st *state) truncate(n int) {
+	for _, c := range st.caches {
+		c.Truncate(n)
+	}
+	st.tokens = st.tokens[:n]
 }
 
 // newState returns an empty sequence with cache room for capacity positions.
 func (m *Model) newState(capacity int) *state {
 	st := &state{m: m}
+	if m.gpu != nil {
+		st.gpu = &gpuState{m: m, capacity: capacity}
+		st.cleanup = runtime.AddCleanup(st, (*gpuState).release, st.gpu)
+		return st
+	}
 	for range m.layers {
 		st.caches = append(st.caches, ops.NewKVCache(m.Config.NumKeyValueHeads, m.Config.HeadDim, capacity))
 	}
@@ -434,8 +595,15 @@ func (m *Model) newState(capacity int) *state {
 // forward runs ids at the next positions, appending their keys and values
 // to the caches, and returns the final normalized hidden states
 // [len(ids), hidden]. keep, if not nil, sees the input to every layer and
-// then the final output.
-func (st *state) forward(ids []int, keep func(*tensor.Tensor)) *tensor.Tensor {
+// then the final output. Only the GPU fails.
+func (st *state) forward(ids []int, keep func(*tensor.Tensor)) (*tensor.Tensor, error) {
+	if st.gpu != nil {
+		y, err := st.gpu.run(len(st.tokens), ids, keep, true, false)
+		if err == nil {
+			st.tokens = append(st.tokens, ids...)
+		}
+		return y, err
+	}
 	m, c := st.m, st.m.Config
 	n, qDim, kvDim := len(ids), c.qDim(), c.kvDim()
 	width := qDim + 2*kvDim
@@ -446,11 +614,12 @@ func (st *state) forward(ids []int, keep func(*tensor.Tensor)) *tensor.Tensor {
 	h, y := tensor.New(n, c.HiddenSize), tensor.New(n, c.HiddenSize)
 	qkv, ctx := tensor.New(n, width), tensor.New(n, qDim)
 	gateUp, act := tensor.New(n, 2*c.IntermediateSize), tensor.New(n, c.IntermediateSize)
-	rot := m.rope.Rotation(st.pos, n)
+	pos := len(st.tokens)
+	rot := m.rope.Rotation(pos, n)
 	args := ops.AttentionArgs{
 		Heads: c.NumAttentionHeads, KVHeads: c.NumKeyValueHeads,
 		Scale:  float32(1 / math.Sqrt(float64(c.HeadDim))),
-		Causal: true, Offset: st.pos,
+		Causal: true, Offset: pos,
 	}
 	for i, l := range m.layers {
 		if keep != nil {
@@ -479,12 +648,12 @@ func (st *state) forward(ids []int, keep func(*tensor.Tensor)) *tensor.Tensor {
 		ops.LinearInto(y, act, l.down, nil)
 		ops.Add(x.Data, y.Data)
 	}
-	st.pos += n
+	st.tokens = append(st.tokens, ids...)
 	ops.RMSNorm(x, m.norm, c.RMSNormEps)
 	if keep != nil {
 		keep(x)
 	}
-	return x
+	return x, nil
 }
 
 // rmsNormInto sets dst to RMSNorm(src) with weight w.

@@ -119,7 +119,7 @@ func TestReLUAndArgmax(t *testing.T) {
 // TestKVCacheMatchesAttentionStrided checks that attention over a KVCache
 // is bit-identical to AttentionStrided on the same keys and values, however
 // the cache was filled (one position at a time from capacity 1, so it grows
-// repeatedly, or all at once).
+// repeatedly, all at once, or past the end and truncated back).
 func TestKVCacheMatchesAttentionStrided(t *testing.T) {
 	r := rand.New(rand.NewPCG(53, 54))
 	tests := []struct {
@@ -157,10 +157,19 @@ func TestKVCacheMatchesAttentionStrided(t *testing.T) {
 				n := min(7, tt.kvSeq-j)
 				chunked.Append(kv[j*2*hidden:], 2*hidden, kv[j*2*hidden+hidden:], 2*hidden, n)
 			}
+			// Filled past the end with other positions, cut back to half,
+			// then given the rest.
+			truncated := NewKVCache(tt.heads, tt.headDim, 1)
+			truncated.Append(kv, 2*hidden, kv[hidden:], 2*hidden, tt.kvSeq/2)
+			other := randomSlice(r, 9*2*hidden)
+			truncated.Append(other, 2*hidden, other[hidden:], 2*hidden, 9)
+			truncated.Truncate(tt.kvSeq / 2)
+			rest := kv[tt.kvSeq/2*2*hidden:]
+			truncated.Append(rest, 2*hidden, rest[hidden:], 2*hidden, tt.kvSeq-tt.kvSeq/2)
 			for _, c := range []struct {
 				name  string
 				cache *KVCache
-			}{{"one by one", oneByOne}, {"at once", atOnce}, {"chunked", chunked}} {
+			}{{"one by one", oneByOne}, {"at once", atOnce}, {"chunked", chunked}, {"truncated", truncated}} {
 				if c.cache.Len() != tt.kvSeq {
 					t.Fatalf("%s: Len %d, want %d", c.name, c.cache.Len(), tt.kvSeq)
 				}

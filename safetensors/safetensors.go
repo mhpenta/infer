@@ -160,6 +160,21 @@ func (f *File) Tensor(name string) (*tensor.Tensor, error) {
 	}
 }
 
+// Bytes returns the named tensor's stored bytes, little-endian in its dtype
+// (see DType), as a read-only view into the mapping, valid until Close.
+func (f *File) Bytes(name string) ([]byte, error) {
+	e, ok := f.entries[name]
+	if !ok {
+		return nil, fmt.Errorf("safetensors: no tensor %q", name)
+	}
+	return f.data[e.Offsets[0]:e.Offsets[1]], nil
+}
+
+// Shape returns the named tensor's shape, or nil if there is no such tensor.
+func (f *File) Shape(name string) []int {
+	return slices.Clone(f.entries[name].Shape)
+}
+
 // Ints returns an integer tensor (I32 or I64), converted to int, and its
 // shape.
 func (f *File) Ints(name string) ([]int, []int, error) {

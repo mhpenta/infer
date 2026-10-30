@@ -55,6 +55,10 @@ func (r *RoPE) Rotation(pos0, seq int) *Rotation {
 	return t
 }
 
+// Tables returns the cosines and sines, each [seq, headDim/2] row-major, for
+// a GPU kernel to rotate with exactly the values Apply uses.
+func (t *Rotation) Tables() (cos, sin []float32) { return t.cos, t.sin }
+
 // Apply rotates the rotation's seq rows of x in place: row i at x[i*ld],
 // heads heads of 2·half values each. Each value is computed as torch's
 // x·cos + rotate_half(x)·sin: two rounded products, then a rounded sum.

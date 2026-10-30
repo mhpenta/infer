@@ -4,6 +4,10 @@
 // summed and layer-normalized, then each layer applies self-attention and a
 // GELU feed-forward block, each followed by a residual add and LayerNorm.
 // Weights use the Hugging Face BertModel tensor names.
+//
+// On Apple silicon the encoder can run on the GPU instead (Options.Device,
+// metal.go): by default it does when the GPU is available and suits the
+// model.
 package bert
 
 import (
@@ -14,6 +18,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/mhpenta/infer/accel"
 	"github.com/mhpenta/infer/ops"
 	"github.com/mhpenta/infer/safetensors"
 	"github.com/mhpenta/infer/tensor"
@@ -58,6 +63,9 @@ type Model struct {
 
 	// workspaces recycles the activation buffers of a forward pass.
 	workspaces sync.Pool
+
+	gpu    *gpuModel // the weights on the GPU, when the model runs there
+	device string
 }
 
 type linear struct {
@@ -75,9 +83,28 @@ type layer struct {
 	outNorm              layerNorm
 }
 
+// Options control how LoadWith prepares a model.
+type Options struct {
+	// Device is where the model runs: accel.CPU, accel.Metal (an Apple
+	// silicon GPU), or accel.Auto. Empty means $INFER_DEVICE, or Auto when
+	// that is unset too. Auto runs on Metal when the GPU is available,
+	// passes its self-check, and suits the model, and on the CPU otherwise;
+	// asking for Metal when it doesn't suit is an error.
+	Device string
+}
+
 // Load reads config.json and model.safetensors from a model directory. The
 // weights stay memory-mapped until Close.
 func Load(dir string) (*Model, error) {
+	return LoadWith(dir, Options{})
+}
+
+// LoadWith is Load with options.
+func LoadWith(dir string, opts Options) (*Model, error) {
+	device, err := accel.Resolve(opts.Device)
+	if err != nil {
+		return nil, fmt.Errorf("bert: %w", err)
+	}
 	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("bert: %w", err)
@@ -93,7 +120,20 @@ func Load(dir string) (*Model, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bert: %w", err)
 	}
-	m, err := newModel(config, weights)
+	var m *Model
+	if device != accel.CPU {
+		var g *gpuModel
+		if g, err = openGPU(config, weights, prefixOf(weights)); err == nil {
+			m = &Model{Config: config, weights: weights, gpu: g, device: fmt.Sprintf("%s (%s)", accel.Metal, g.gpu.Device.Name())}
+		} else if device == accel.Metal {
+			err = fmt.Errorf("cannot run on Metal: %w", err)
+		} else {
+			err = nil // Auto: the CPU, then
+		}
+	}
+	if m == nil && err == nil {
+		m, err = newModel(config, weights)
+	}
 	if err != nil {
 		weights.Close()
 		return nil, fmt.Errorf("bert: %w", err)
@@ -101,14 +141,17 @@ func Load(dir string) (*Model, error) {
 	return m, nil
 }
 
-func newModel(config Config, weights *safetensors.File) (*Model, error) {
-	// Checkpoints saved from task models (BertForMaskedLM, ...) nest the
-	// encoder under "bert.".
-	prefix := ""
+// prefixOf returns the prefix of the encoder's tensor names: checkpoints
+// saved from task models (BertForMaskedLM, ...) nest it under "bert.".
+func prefixOf(weights *safetensors.File) string {
 	if !weights.Has("embeddings.word_embeddings.weight") && weights.Has("bert.embeddings.word_embeddings.weight") {
-		prefix = "bert."
+		return "bert."
 	}
-	l := loader{weights: weights, prefix: prefix, half: useHalfPanels()}
+	return ""
+}
+
+func newModel(config Config, weights *safetensors.File) (*Model, error) {
+	l := loader{weights: weights, prefix: prefixOf(weights), half: useHalfPanels()}
 	h := config.HiddenSize
 	m := &Model{
 		Config:  config,
@@ -117,6 +160,7 @@ func newModel(config Config, weights *safetensors.File) (*Model, error) {
 		typeEmb: l.tensor("embeddings.token_type_embeddings.weight", config.TypeVocabSize, h),
 		embNorm: l.layerNorm("embeddings.LayerNorm", h),
 		weights: weights,
+		device:  accel.CPU,
 	}
 	for i := range config.NumHiddenLayers {
 		p := fmt.Sprintf("encoder.layer.%d.", i)
@@ -135,8 +179,15 @@ func newModel(config Config, weights *safetensors.File) (*Model, error) {
 	return m, nil
 }
 
-// Close releases the memory-mapped weights.
+// Device returns where the model runs: "cpu", or "metal (" and the GPU's
+// name ")".
+func (m *Model) Device() string { return m.device }
+
+// Close releases the memory-mapped weights and any GPU memory.
 func (m *Model) Close() error {
+	if m.gpu != nil {
+		m.gpu.release()
+	}
 	return m.weights.Close()
 }
 
@@ -169,6 +220,9 @@ func (m *Model) run(ids []int, keepAll bool) ([]*tensor.Tensor, error) {
 		}
 	}
 
+	if m.gpu != nil {
+		return m.gpu.run(m.Config, ids, keepAll)
+	}
 	ws := m.workspace(len(ids))
 	defer m.workspaces.Put(ws)
 	x, next := ws.x, ws.next

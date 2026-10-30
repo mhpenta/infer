@@ -1,12 +1,17 @@
 # infer
 
-Transformer inference on the CPU in Go: load Hugging Face weights, tokenize,
-run the model, pool or quantize the result. No cgo, no ONNX, no Python.
+Transformer inference in Go, on the CPU or an Apple silicon GPU: load Hugging
+Face weights, tokenize, run the model, pool or quantize the result. No cgo, no
+ONNX, no Python.
 
 Outputs match PyTorch: every model is checked layer by layer against
 reference outputs dumped from `transformers` (see [Testing](#testing)).
 
 ## What it runs today
+
+Every model also runs on the Apple silicon GPU (the default there), and is
+checked against the same goldens on both devices; see
+[GPU inference](docs/accelerator-plan.md).
 
 | Model | Output | Check against PyTorch |
 |-------|--------|-----------------------|
@@ -14,7 +19,7 @@ reference outputs dumped from `transformers` (see [Testing](#testing)).
 | [mxbai-embed-large-v1](https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1) (BERT, 335M, fp16) | 512-bit binary embedding (CLS, normalize, Matryoshka 512, sign bits) | bit-identical on 20 texts |
 | [t5-small](https://huggingface.co/google-t5/t5-small) (T5, 60M) and T5 fine-tunes | greedy generation with a KV cache | every encoder and decoder layer within 1.5e-6 of its range; generated tokens identical on 5 inputs up to 512 tokens |
 | [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) (Llama architecture, 1.1B, bf16) | greedy generation with a KV cache, chat template | every layer within 5.8e-6 of its range; top-64 logits within 1e-5 at every position; generated tokens identical on 4 prompts up to 2,461 tokens |
-| [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B) (same architecture, 42 layers, bf16) | the same, with its own chat template | chat template matches transformers on 12 conversations; generated tokens identical on 3 prompts (not in CI: 5 GB, `scripts/fetch_models.sh minicpm5-2b`) |
+| [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B) (same architecture, 42 layers, bf16) | the same, with its own chat template | chat template matches transformers on 12 conversations; generated tokens identical on 3 prompts; on the GPU, the CPU's tokens with logits within 6.5e-6 (not in CI: 5 GB, `scripts/fetch_models.sh minicpm5-2b`) |
 | [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) (`Qwen3ForCausalLM`: per-head q/k RMSNorm, tied embeddings, bf16) | greedy or sampled generation, chat template, NFC tokenizer | every layer within 7.3e-6 of its range; top-64 logits within 1.2e-5 after the first position (3e-5 there, an attention sink); generated tokens identical on 4 prompts up to 2,579 tokens (not in CI: 4.1 GB, `scripts/fetch_models.sh qwen3`) |
 
 ## Packages
@@ -28,9 +33,11 @@ reference outputs dumped from `transformers` (see [Testing](#testing)).
 | `tokenizer/unigram` | SentencePiece Unigram from `tokenizer.json` (T5), including the precompiled NFKC character map |
 | `tokenizer/bpe` | byte-level BPE from `tokenizer.json` (MiniCPM5, Qwen3 and other GPT-2-style tokenizers): NFC normalization, the GPT-4-style split patterns as hand-written scanners |
 | `tokenizer/chat` | chat templates in Go, recognized by the hash of the model's Jinja template (MiniCPM5-1B and -2B, Qwen3), with Qwen3 tool calling: tool definitions, tool calls and responses, and parsing calls from a reply |
-| `model/bert` | the BERT encoder |
-| `model/t5` | the T5 encoder-decoder: relative position bias, cross-attention, greedy decoding with a KV cache |
-| `model/llama` | Llama-family decoders (`LlamaForCausalLM`, `Qwen3ForCausalLM`): grouped-query attention, rotary embeddings, SwiGLU, bf16 or int8 weights (`llama.LoadWith(dir, llama.Options{Int8: true})`), greedy or sampled decoding with a KV cache |
+| `model/bert` | the BERT encoder; on Apple silicon, on the GPU by default (`bert.LoadWith(dir, bert.Options{Device: ...})`) |
+| `model/t5` | the T5 encoder-decoder: relative position bias, cross-attention, greedy decoding with a KV cache; on Apple silicon, on the GPU by default (`t5.Options`) |
+| `model/llama` | Llama-family decoders (`LlamaForCausalLM`, `Qwen3ForCausalLM`): grouped-query attention, rotary embeddings, SwiGLU, bf16 or int8 weights (`llama.LoadWith(dir, llama.Options{Int8: true})`), greedy or sampled decoding with a KV cache; on Apple silicon, on the GPU by default, bf16 or int8 (`Options.Device`, `INFER_DEVICE`), checked against the same goldens |
+| `accel` | choosing the device a model runs on: the option, then `INFER_DEVICE`, then auto; opens the GPU once per process and self-checks its kernels against `ops` |
+| `metal` | GPU compute through Apple's Metal, without cgo (through `internal/objc`): devices, run-time compiled kernels, shared buffers, command buffers, and the models' kernels (products over bf16, fp16, float32 or int8 weights, RMSNorm and LayerNorm, RoPE, attention over a key/value cache, causal or not, with an optional bias, SwiGLU, GELU and ReLU, embedding lookup, argmax), each checked against `ops`. Every model in `model/` runs on it; see [GPU inference](docs/accelerator-plan.md) |
 | `sample` | choosing the next token: greedy, or temperature, top-k, top-p and repetition penalty with transformers' meaning and order, defaults read from `generation_config.json`; the distributions match transformers' logits processors |
 | `pool` | mean and CLS pooling, L2 normalization |
 | `quant` | sentence-transformers' binary quantization |
@@ -72,6 +79,12 @@ err = model.GenerateWith(tok.EncodeRaw(prompt), 512, s, func(token int, _ []floa
 	out = append(out, token)
 	return true
 })
+
+// A conversation re-renders its whole history each round. A session keeps
+// the keys and values it has computed and runs only what a prompt adds to
+// the longest prefix it shares with the last one.
+session := model.NewSession()
+err = session.GenerateWith(tok.EncodeRaw(prompt), 512, s, fn)
 ```
 
 ## How the matrix products work
@@ -112,7 +125,10 @@ rest. Decoding is bound by memory bandwidth: on an M2 Max the bf16 kernel
 streams about 96 GB/s from DRAM, against roughly 115 GB/s for plain reads.
 `ops.KVCache` keeps attention keys and values in the packed layout the kernels
 read, appended once per position, so a decoder step packs nothing but its own
-new key and value.
+new key and value. `KVCache.Truncate` cuts it back to a prefix, which is how
+`llama.Session` reuses a shared prompt prefix. Every operation computes a row
+the same way whichever rows run with it, so a reused prefix gives
+bit-identical logits to running the whole prompt again.
 
 The amd64 assembly is generated by `scripts/gen_amd64_kernels.py`.
 

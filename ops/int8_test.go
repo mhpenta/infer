@@ -160,3 +160,25 @@ func TestKernelInt8MatchesPortable(t *testing.T) {
 		}
 	}
 }
+
+// TestQuantizeInt8 checks that the row-major quantization holds the same
+// integers and scales as PackInt8's panels.
+func TestQuantizeInt8(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 8))
+	for _, sh := range [][2]int{{1, 5}, {37, 100}, {130, 64}} {
+		n, k := sh[0], sh[1]
+		w := int8Weights(r, n, k)
+		q, scale := QuantizeInt8(w)
+		p := PackInt8(w)
+		if !slices.Equal(scale, p.scale) {
+			t.Fatalf("%dx%d: scales differ from PackInt8's", n, k)
+		}
+		for j := range n {
+			for kk := range k {
+				if got, want := q[j*k+kk], p.quant[(j/nr)*k*nr+kk*nr+j%nr]; got != want {
+					t.Fatalf("%dx%d: q[%d,%d] = %d, PackInt8 has %d", n, k, j, kk, got, want)
+				}
+			}
+		}
+	}
+}

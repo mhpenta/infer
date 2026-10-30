@@ -5,23 +5,32 @@ import (
 	"math"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/mhpenta/infer/internal/golden"
+	"github.com/mhpenta/infer/metal"
 	"github.com/mhpenta/infer/tensor"
 )
 
-// int8Model loads MiniCPM5-1B with int8 weights once for all tests.
-func int8Model(t *testing.T) *Model {
+// int8Model loads MiniCPM5-1B with int8 weights on device.
+func int8Model(t *testing.T, device string) *Model {
 	t.Helper()
-	if shared.int8 == nil {
-		m, err := LoadWith(golden.ModelDir(t, "INFER_MINICPM5_DIR", "minicpm5-1b"), Options{Int8: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		shared.int8 = m
+	m, err := LoadWith(golden.ModelDir(t, "INFER_MINICPM5_DIR", "minicpm5-1b"), Options{Int8: true, Device: device})
+	if err != nil {
+		t.Fatal(err)
 	}
-	return shared.int8
+	if !strings.HasPrefix(m.Device(), device) {
+		t.Fatalf("int8 weights loaded on %s, want %s", m.Device(), device)
+	}
+	quantized := m.lmHead != nil && m.lmHead.Int8() && m.layers[0].gateUp.Int8() && m.embed.bf16 != nil
+	if g := m.gpu; g != nil {
+		quantized = g.lmHead.Type == metal.Int8 && g.layers[0].gateUp.Type == metal.Int8 && g.embedType != metal.Int8
+	}
+	if !quantized {
+		t.Fatal("int8 model does not hold int8 linear layers and bf16 embeddings")
+	}
+	return m
 }
 
 // agreement is how closely one model's next-token distributions follow a
@@ -43,8 +52,7 @@ func (a agreement) String() string {
 // distributions at every position; next[p] is the token that follows
 // position p.
 func compareModels(model, ref *Model, seq, next []int) agreement {
-	y := model.newState(len(seq)).forward(seq, nil)
-	yr := ref.newState(len(seq)).forward(seq, nil)
+	y, yr := forwardAll(model, seq), forwardAll(ref, seq)
 	const chunk = 64
 	vocab := model.Config.VocabSize
 	var a agreement
@@ -93,18 +101,24 @@ func argmax64(x []float64) int {
 }
 
 // TestInt8MatchesBF16 checks MiniCPM5-1B with int8 weights against the same
-// model in bf16 (which matches PyTorch) on every golden sequence: the top
-// token must agree at most positions, the distributions must stay close (on
-// MiniCPM5-1B: 94-100% agreement and a mean KL divergence of 0.0003-0.007
-// nats, with no measurable change from keeping the output layer in bf16),
-// and greedy generation must give PyTorch's tokens.
+// model in bf16 (which matches PyTorch) on every golden sequence, on each
+// device: the top token must agree at most positions, the distributions
+// must stay close (on MiniCPM5-1B: 94-100% agreement and a mean KL
+// divergence of 0.0003-0.007 nats, with no measurable change from keeping
+// the output layer in bf16), and greedy generation must give PyTorch's
+// tokens.
 func TestInt8MatchesBF16(t *testing.T) {
-	m, cases, _ := loadMiniCPM(t)
-	q := int8Model(t)
-	defer func() { shared.int8 = nil; runtime.GC() }()
-	if !q.lmHead.Int8() || !q.layers[0].gateUp.Int8() || q.embed.bf16 == nil {
-		t.Fatal("int8 model does not hold int8 linear layers and bf16 embeddings")
+	for _, device := range testDevices(t) {
+		t.Run(device, func(t *testing.T) { checkInt8(t, device) })
 	}
+}
+
+func checkInt8(t *testing.T, device string) {
+	g := miniCPM.on(device)
+	m, cases, _ := g.load(t)
+	defer g.release()
+	q := int8Model(t, device)
+	defer func() { q.Close(); runtime.GC() }()
 	for i, c := range cases {
 		t.Run(fmt.Sprintf("case%d_%d_in", i, len(c.InputIDs)), func(t *testing.T) {
 			if i == longCase && testing.Short() {

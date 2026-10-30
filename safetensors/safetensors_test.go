@@ -74,7 +74,20 @@ func TestTensorDTypes(t *testing.T) {
 			if !slices.Equal(got.Shape, tt.shape) || !slices.Equal(got.Data, tt.want) {
 				t.Errorf("got %v %v, want %v %v", got.Shape, got.Data, tt.shape, tt.want)
 			}
+			if shape := f.Shape(tt.name); !slices.Equal(shape, tt.shape) {
+				t.Errorf("Shape = %v, want %v", shape, tt.shape)
+			}
 		})
+	}
+	// Bytes is the stored encoding, untouched.
+	if b, err := f.Bytes("bf16"); err != nil || !slices.Equal(b, data[24:28]) {
+		t.Errorf("Bytes(bf16) = %v, %v; want %v", b, err, data[24:28])
+	}
+	if _, err := f.Bytes("missing"); err == nil {
+		t.Error("Bytes of a missing tensor succeeded")
+	}
+	if f.Shape("missing") != nil {
+		t.Error("Shape of a missing tensor is not nil")
 	}
 }
 

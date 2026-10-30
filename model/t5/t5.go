@@ -17,6 +17,10 @@
 //     the decoder output by d_model^-0.5.
 //
 // Weights use the Hugging Face tensor names.
+//
+// On Apple silicon the model can run on the GPU instead (Options.Device,
+// metal.go): by default it does when the GPU is available and suits the
+// model.
 package t5
 
 import (
@@ -26,7 +30,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 
+	"github.com/mhpenta/infer/accel"
 	"github.com/mhpenta/infer/ops"
 	"github.com/mhpenta/infer/safetensors"
 	"github.com/mhpenta/infer/tensor"
@@ -98,6 +104,9 @@ type Model struct {
 	decNorm *tensor.Tensor
 	decBias *tensor.Tensor
 	weights *safetensors.File
+
+	gpu    *gpuModel // the weights on the GPU, when the model runs there
+	device string
 }
 
 type encoderLayer struct {
@@ -119,8 +128,27 @@ type decoderLayer struct {
 	wi, wo    *ops.Packed
 }
 
+// Options control how LoadWith prepares a model.
+type Options struct {
+	// Device is where the model runs: accel.CPU, accel.Metal (an Apple
+	// silicon GPU), or accel.Auto. Empty means $INFER_DEVICE, or Auto when
+	// that is unset too. Auto runs on Metal when the GPU is available,
+	// passes its self-check, and suits the model, and on the CPU otherwise;
+	// asking for Metal when it doesn't suit is an error.
+	Device string
+}
+
 // Load reads config.json and model.safetensors from a model directory.
 func Load(dir string) (*Model, error) {
+	return LoadWith(dir, Options{})
+}
+
+// LoadWith is Load with options.
+func LoadWith(dir string, opts Options) (*Model, error) {
+	device, err := accel.Resolve(opts.Device)
+	if err != nil {
+		return nil, fmt.Errorf("t5: %w", err)
+	}
 	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("t5: %w", err)
@@ -137,7 +165,32 @@ func Load(dir string) (*Model, error) {
 	if err != nil {
 		return nil, fmt.Errorf("t5: %w", err)
 	}
-	m, err := newModel(config, weights)
+	var m *Model
+	if device != accel.CPU {
+		var g *gpuModel
+		if g, err = openGPU(config, weights); err == nil {
+			l := loader{weights: weights}
+			m = &Model{
+				Config:  config,
+				encBias: l.tensor("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight", config.RelativeAttentionNumBuckets, config.NumHeads),
+				decBias: l.tensor("decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight", config.RelativeAttentionNumBuckets, config.NumHeads),
+				weights: weights,
+				gpu:     g,
+				device:  fmt.Sprintf("%s (%s)", accel.Metal, g.gpu.Device.Name()),
+			}
+			if err = l.err; err != nil {
+				g.release()
+				m = nil
+			}
+		} else if device == accel.Metal {
+			err = fmt.Errorf("cannot run on Metal: %w", err)
+		} else {
+			err = nil // Auto: the CPU, then
+		}
+	}
+	if m == nil && err == nil {
+		m, err = newModel(config, weights)
+	}
 	if err != nil {
 		weights.Close()
 		return nil, fmt.Errorf("t5: %w", err)
@@ -156,6 +209,7 @@ func newModel(c Config, weights *safetensors.File) (*Model, error) {
 		decNorm: l.tensor("decoder.final_layer_norm.weight", d),
 		decBias: l.tensor("decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight", c.RelativeAttentionNumBuckets, c.NumHeads),
 		weights: weights,
+		device:  accel.CPU,
 	}
 	if c.tied() {
 		m.lmHead = l.pack(m.shared, "shared.weight")
@@ -194,8 +248,15 @@ func newModel(c Config, weights *safetensors.File) (*Model, error) {
 	return m, nil
 }
 
-// Close releases the memory-mapped weights.
+// Device returns where the model runs: "cpu", or "metal (" and the GPU's
+// name ")".
+func (m *Model) Device() string { return m.device }
+
+// Close releases the memory-mapped weights and any GPU memory.
 func (m *Model) Close() error {
+	if m.gpu != nil {
+		m.gpu.release()
+	}
 	return m.weights.Close()
 }
 
@@ -231,6 +292,9 @@ func (m *Model) EncoderHiddenStates(ids []int) ([]*tensor.Tensor, error) {
 func (m *Model) encode(ids []int, keepAll bool) ([]*tensor.Tensor, error) {
 	if err := m.checkIDs(ids); err != nil {
 		return nil, err
+	}
+	if m.gpu != nil {
+		return m.gpu.encode(m, ids, keepAll)
 	}
 	c := m.Config
 	seq, inner := len(ids), c.inner()
@@ -274,6 +338,9 @@ func (m *Model) norm(dst, src, w *tensor.Tensor) {
 func (m *Model) DecoderHiddenStates(enc *tensor.Tensor, ids []int) ([]*tensor.Tensor, *tensor.Tensor, error) {
 	if err := m.checkIDs(ids); err != nil {
 		return nil, nil, err
+	}
+	if m.gpu != nil {
+		return m.gpu.decode(m, enc, ids)
 	}
 	c := m.Config
 	n, encSeq, inner := len(ids), enc.Rows(), c.inner()
@@ -344,11 +411,19 @@ func (m *Model) Generate(ids []int, maxNew int) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := m.newDecoderState(enc, maxNew)
+	st, err := m.newDecoderState(enc, maxNew)
+	if err != nil {
+		return nil, err
+	}
+	defer st.release()
 	var out []int
 	token := m.Config.DecoderStartTokenID
 	for len(out) < maxNew {
-		token = ops.Argmax(st.step(token))
+		logits, err := st.step(token)
+		if err != nil {
+			return nil, err
+		}
+		token = ops.Argmax(logits)
 		out = append(out, token)
 		if token == m.Config.EOSTokenID {
 			break
@@ -369,13 +444,25 @@ type decoderState struct {
 	y, h, z, qkv, q, ctx, ff *tensor.Tensor // one row each
 	logits                   *tensor.Tensor // [1, vocab]
 	bias                     []float32      // the step's position bias, [heads, pos+1]
+
+	gpu     *gpuDecoder     // the GPU's caches and buffers, when the model runs there
+	cleanup runtime.Cleanup // releases gpu when the state is unreachable
 }
 
 // newDecoderState prepares decoding over enc, with room for steps positions
-// before the caches grow.
-func (m *Model) newDecoderState(enc *tensor.Tensor, steps int) *decoderState {
+// before the caches grow. Only the GPU fails.
+func (m *Model) newDecoderState(enc *tensor.Tensor, steps int) (*decoderState, error) {
 	c := m.Config
 	inner, steps := c.inner(), max(steps, 1)
+	if m.gpu != nil {
+		g, err := m.gpu.newDecoder(m, enc, steps)
+		if err != nil {
+			return nil, err
+		}
+		st := &decoderState{m: m, gpu: g}
+		st.cleanup = runtime.AddCleanup(st, (*gpuDecoder).release, g)
+		return st, nil
+	}
 	st := &decoderState{
 		m: m,
 		y: tensor.New(1, c.DModel), h: tensor.New(1, c.DModel), z: tensor.New(1, c.DModel),
@@ -391,12 +478,28 @@ func (m *Model) newDecoderState(enc *tensor.Tensor, steps int) *decoderState {
 		st.cross = append(st.cross, cross)
 		st.self = append(st.self, ops.NewKVCache(c.NumHeads, c.DKV, steps))
 	}
-	return st
+	return st, nil
+}
+
+// release frees the state's GPU memory, if any, without waiting for the
+// garbage collector. The state must not be used after.
+func (st *decoderState) release() {
+	if st.gpu != nil {
+		st.cleanup.Stop()
+		st.gpu.release()
+		st.gpu = nil
+	}
 }
 
 // step runs the decoder on token at the next position and returns the
 // logits for the position after it. The slice is reused by the next step.
-func (st *decoderState) step(token int) []float32 {
+// Only the GPU fails.
+func (st *decoderState) step(token int) ([]float32, error) {
+	if st.gpu != nil {
+		logits, err := st.gpu.step(token, st.pos)
+		st.pos++
+		return logits, err
+	}
 	m, c := st.m, st.m.Config
 	inner, pos := c.inner(), st.pos
 	copy(st.y.Data, m.shared.Row(token))
@@ -427,7 +530,7 @@ func (st *decoderState) step(token int) []float32 {
 	st.pos++
 	ops.RMSNorm(st.y, m.decNorm, c.LayerNormEpsilon)
 	m.logitsInto(st.logits, st.y)
-	return st.logits.Row(0)
+	return st.logits.Row(0), nil
 }
 
 // generateUncached is greedy generation that re-runs the decoder over the

@@ -294,6 +294,15 @@ Measured old against new in the same process, best of 6:
   only 1.13–1.14× faster on NEON, where widening int8 costs more
   instructions than bf16; amd64 is still to be measured. Next would be int8
   activations with `SDOT`.
+- Prefix reuse: done, in `llama.Session` (with `ops.KVCache.Truncate`).
+  Each call runs only what its prompt adds to the longest prefix it shares
+  with the session's tokens, with logits bit-identical to a fresh run
+  (checked against `GenerateFunc` on every golden case, bf16 and int8). On
+  Qwen3-1.7B tool-calling conversations, where every round re-renders a
+  2,000–7,500-token prompt of tools, four multi-round conversations went
+  from 1,902 s to 389 s (one of them from 1,189 s to 59 s), with identical
+  transcripts. Prefill itself is still 67–105 tokens/s, so a cold
+  7,500-token prompt still takes about 2 minutes.
 - A streaming `Generate` (a callback or iterator per token) for a goinfer
   endpoint.
 

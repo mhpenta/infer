@@ -1,12 +1,17 @@
 package bert
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/mhpenta/infer/accel"
 	"github.com/mhpenta/infer/internal/golden"
+	"github.com/mhpenta/infer/metal"
 	"github.com/mhpenta/infer/pool"
 	"github.com/mhpenta/infer/safetensors"
 	"github.com/mhpenta/infer/tokenizer/wordpiece"
@@ -20,13 +25,44 @@ const (
 	minCosine = 0.9999
 )
 
-func TestMiniLMMatchesPython(t *testing.T) {
-	dir := golden.ModelDir(t, "INFER_MINILM_DIR", "all-MiniLM-L6-v2")
-	model, err := Load(dir)
+// testDevices returns the devices to test on: the CPU, and Metal when this
+// machine has it (or must, with INFER_REQUIRE_METAL=1).
+func testDevices(t testing.TB) []string {
+	_, err := accel.OpenMetal()
+	if errors.Is(err, metal.ErrUnavailable) && os.Getenv("INFER_REQUIRE_METAL") != "1" {
+		return []string{accel.CPU}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer model.Close()
+	return []string{accel.CPU, accel.Metal}
+}
+
+// loadOn loads the model in dir on device, closing it when the test ends.
+func loadOn(t testing.TB, dir, device string) *Model {
+	t.Helper()
+	model, err := LoadWith(dir, Options{Device: device})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(model.Device(), device) {
+		t.Fatalf("loaded on %s, want %s", model.Device(), device)
+	}
+	t.Cleanup(func() { model.Close() })
+	return model
+}
+
+// TestMiniLMMatchesPython checks every layer's output and the pooled
+// embedding against PyTorch, on each device.
+func TestMiniLMMatchesPython(t *testing.T) {
+	for _, device := range testDevices(t) {
+		t.Run(device, func(t *testing.T) { checkMiniLM(t, device) })
+	}
+}
+
+func checkMiniLM(t *testing.T, device string) {
+	dir := golden.ModelDir(t, "INFER_MINILM_DIR", "all-MiniLM-L6-v2")
+	model := loadOn(t, dir, device)
 	tok, err := wordpiece.LoadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -135,7 +171,13 @@ func cosine(a, b []float32) float64 {
 }
 
 func BenchmarkMiniLMForward(b *testing.B) {
-	model, err := Load(golden.ModelDir(b, "INFER_MINILM_DIR", "all-MiniLM-L6-v2"))
+	for _, device := range testDevices(b) {
+		b.Run(device, func(b *testing.B) { benchMiniLM(b, device) })
+	}
+}
+
+func benchMiniLM(b *testing.B, device string) {
+	model, err := LoadWith(golden.ModelDir(b, "INFER_MINILM_DIR", "all-MiniLM-L6-v2"), Options{Device: device})
 	if err != nil {
 		b.Fatal(err)
 	}

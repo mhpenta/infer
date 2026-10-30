@@ -362,6 +362,27 @@ func (c *KVCache) Append(k []float32, ldk int, v []float32, ldv int, count int) 
 	}
 }
 
+// Truncate drops every position from n on, so the cache holds a prefix of
+// what it held and the next Append writes position n. The dropped positions
+// are cleared, leaving the cache as if only the first n had been appended.
+func (c *KVCache) Truncate(n int) {
+	if n < 0 || n > c.n {
+		panic(fmt.Sprintf("ops.KVCache.Truncate: %d positions, cache has %d", n, c.n))
+	}
+	hd := c.headDim
+	for h := range c.heads {
+		keys, values := c.keys[h].data, c.values[h].data
+		for pos := n; pos < c.n; pos++ {
+			for d := range hd {
+				keys[(pos/nr)*hd*nr+pos%nr+d*nr] = 0
+				values[(d/nr)*c.capacity*nr+pos*nr+d%nr] = 0
+			}
+		}
+		c.keys[h].n, c.values[h].k = n, n
+	}
+	c.n = n
+}
+
 // Attend computes attention for seq queries (row i at q[i*ldq],
 // args.Heads·headDim wide) over every cached position, writing the context
 // for query i to out[i*ldOut:]. The cache holds the key/value heads:

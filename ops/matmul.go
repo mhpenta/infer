@@ -188,6 +188,21 @@ func PackInt8(w *tensor.Tensor) *Packed {
 	return p
 }
 
+// QuantizeInt8 quantizes each row of w [n, k] as PackInt8 does and returns
+// the integers row-major, n·k of them, and one scale per row: the layout a
+// GPU kernel reads. The values are the same as PackInt8's.
+func QuantizeInt8(w *tensor.Tensor) ([]int8, []float32) {
+	n, k := w.Rows(), w.Cols()
+	q, scale := make([]int8, n*k), make([]float32, n)
+	const rows = 64
+	forEach((n+rows-1)/rows, runtime.GOMAXPROCS(0), func(b int) {
+		for j := b * rows; j < min(n, (b+1)*rows); j++ {
+			scale[j] = quantizeRow(q[j*k:(j+1)*k], w.Row(j))
+		}
+	})
+	return q, scale
+}
+
 // quantizeRow sets q to row in units of its returned scale, max|row|/127,
 // rounding to the nearest integer. A row of zeros gets scale 0.
 func quantizeRow(q []int8, row []float32) float32 {
