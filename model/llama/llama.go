@@ -14,6 +14,9 @@
 // On Apple silicon the model can run on the GPU instead (Options.Device,
 // metal.go): by default it does when the GPU is available and suits the
 // model.
+//
+// Capture, GenerateCapture and Session.SetCapture read what attention and the
+// feed-forward compute in selected layers (capture.go).
 package llama
 
 import (
@@ -183,9 +186,15 @@ type Options struct {
 	// Device is where the model runs: accel.CPU, accel.Metal (an Apple
 	// silicon GPU), or accel.Auto. Empty means $INFER_DEVICE, or Auto when
 	// that is unset too. Auto runs on Metal when the GPU is available,
-	// passes its self-check, and suits the model (bf16 weights that fit in
-	// its working set, no Int8), and on the CPU otherwise; asking for Metal
-	// when it doesn't suit is an error.
+	// passes its self-check, and suits the model (shapes its kernels take,
+	// weights that fit in its working set, and layers that share one dtype
+	// where they stack), and on the CPU otherwise, without saying why: check
+	// Device. Asking for Metal when it doesn't suit is an error that says why.
+	//
+	// A checkpoint can mix dtypes between tensors, as a bf16 model edited
+	// with float32 tensors does. The CPU takes any mix. The GPU keeps each
+	// linear layer's own dtype, but q, k and v, and gate and up, are one
+	// stacked layer to it, which fails when only some of them are float32.
 	Device string
 }
 
@@ -535,7 +544,7 @@ func (st *state) generate(prompt []int, maxNew int, s *sample.Sampler, fn func(t
 // last, valid until the next call.
 func (st *state) next(ids []int) ([]float32, error) {
 	if st.gpu != nil {
-		if _, err := st.gpu.run(len(st.tokens), ids, nil, false, true); err != nil {
+		if _, err := st.gpu.run(len(st.tokens), ids, nil, st.capture, false, true); err != nil {
 			return nil, err
 		}
 		st.tokens = append(st.tokens, ids...)
@@ -558,6 +567,7 @@ type state struct {
 	logits  *tensor.Tensor // the CPU's last logits
 	gpu     *gpuState
 	cleanup runtime.Cleanup // releases gpu when the state is unreachable
+	capture *capturePlan    // what forward passes report, or nil
 }
 
 // release frees the state's GPU memory, if any, without waiting for the
@@ -598,7 +608,7 @@ func (m *Model) newState(capacity int) *state {
 // then the final output. Only the GPU fails.
 func (st *state) forward(ids []int, keep func(*tensor.Tensor)) (*tensor.Tensor, error) {
 	if st.gpu != nil {
-		y, err := st.gpu.run(len(st.tokens), ids, keep, true, false)
+		y, err := st.gpu.run(len(st.tokens), ids, keep, st.capture, true, false)
 		if err == nil {
 			st.tokens = append(st.tokens, ids...)
 		}
@@ -641,12 +651,19 @@ func (st *state) forward(ids []int, keep func(*tensor.Tensor)) (*tensor.Tensor, 
 		cache.Attend(ctx.Data, qDim, qkv.Data, width, n, args)
 		ops.LinearInto(y, ctx, l.out, nil)
 		ops.Add(x.Data, y.Data)
+		if st.capture != nil {
+			st.capture.report(i, AttentionOut, pos, y)
+		}
 
 		rmsNormInto(h, x, l.ffNorm, c.RMSNormEps)
 		ops.LinearInto(gateUp, h, l.gateUp, nil)
 		ops.SwiGLUInto(act, gateUp)
 		ops.LinearInto(y, act, l.down, nil)
 		ops.Add(x.Data, y.Data)
+		if st.capture != nil {
+			st.capture.report(i, SwiGLUOut, pos, act)
+			st.capture.report(i, MLPOut, pos, y)
+		}
 	}
 	st.tokens = append(st.tokens, ids...)
 	ops.RMSNorm(x, m.norm, c.RMSNormEps)

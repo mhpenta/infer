@@ -100,3 +100,56 @@ func BenchmarkPrefill(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkDecodeCapture times decoding MiniCPM5-1B with nothing selected, one
+// layer's three points, and every layer's, on each device. Fn only counts: this
+// is what capturing costs before a caller copies anything. BenchmarkDecode is
+// the measure of capture being off.
+func BenchmarkDecodeCapture(b *testing.B) {
+	all := []Point{AttentionOut, SwiGLUOut, MLPOut}
+	for _, device := range testDevices(b) {
+		g := miniCPM.on(device)
+		for _, tt := range []struct {
+			name string
+			c    *Capture
+		}{
+			{"off", nil},
+			{"one_layer", &Capture{Layers: []int{12}, Points: all}},
+			{"every_layer", &Capture{Points: all}},
+		} {
+			b.Run(g.key()+"/"+tt.name, func(b *testing.B) {
+				m, cases, _ := g.load(b)
+				prompt := cases[2].InputIDs
+				const steps = 32
+				seen := 0
+				var plan *capturePlan
+				if tt.c != nil {
+					c := *tt.c
+					c.Fn = func(Activation) { seen++ }
+					var err error
+					if plan, err = m.plan(c); err != nil {
+						b.Fatal(err)
+					}
+				}
+				var elapsed time.Duration
+				for range b.N {
+					st := m.newState(len(prompt) + steps)
+					st.capture = plan
+					logits, err := st.next(prompt)
+					start := time.Now()
+					for range steps {
+						if err != nil {
+							b.Fatal(err)
+						}
+						logits, err = st.next([]int{ops.Argmax(logits)})
+					}
+					elapsed += time.Since(start)
+					st.release()
+				}
+				perToken := elapsed / time.Duration(b.N*steps)
+				b.ReportMetric(float64(perToken.Microseconds())/1e3, "ms/token")
+			})
+		}
+		g.release()
+	}
+}

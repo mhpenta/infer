@@ -138,6 +138,7 @@ type gpuState struct {
 	capacity                                              int // positions the caches are to hold when first allocated
 	rows                                                  int // rows the scratch buffers hold
 	x, h, y, qkv, ctx, gateUp, act, ids, cos, sin, logits *metal.Buffer
+	captured                                              *metal.Buffer // what a Capture selects, grown as needed
 }
 
 func (s *gpuState) release() {
@@ -149,6 +150,10 @@ func (s *gpuState) release() {
 	if s.logits != nil {
 		s.logits.Release()
 		s.logits = nil
+	}
+	if s.captured != nil {
+		s.captured.Release()
+		s.captured = nil
 	}
 }
 
@@ -237,8 +242,9 @@ func (s *gpuState) grow(capacity int) error {
 // caches. With hidden, it returns the final normalized hidden states
 // [len(ids), hidden] in Go memory; with logits, it leaves the last
 // position's logits in s.logits. keep, if not nil, sees the input to every
-// layer and then the final output, all rows at once.
-func (s *gpuState) run(pos int, ids []int, keep func(*tensor.Tensor), hidden, logits bool) (*tensor.Tensor, error) {
+// layer and then the final output, all rows at once. capture, if not nil,
+// sees its selection after each chunk.
+func (s *gpuState) run(pos int, ids []int, keep func(*tensor.Tensor), capture *capturePlan, hidden, logits bool) (*tensor.Tensor, error) {
 	c := s.m.Config
 	var out *tensor.Tensor
 	if hidden {
@@ -251,7 +257,7 @@ func (s *gpuState) run(pos int, ids []int, keep func(*tensor.Tensor), hidden, lo
 	for start := 0; start < len(ids); start += chunk {
 		part := ids[start:min(start+chunk, len(ids))]
 		last := start+len(part) == len(ids)
-		if err := s.chunk(pos+start, part, keep, logits && last); err != nil {
+		if err := s.chunk(pos+start, part, keep, capture, logits && last); err != nil {
 			return nil, err
 		}
 		if hidden {
@@ -262,8 +268,10 @@ func (s *gpuState) run(pos int, ids []int, keep func(*tensor.Tensor), hidden, lo
 }
 
 // chunk runs ids at positions pos.. in one command buffer (one per layer
-// with keep, which reads every layer's input).
-func (s *gpuState) chunk(pos int, ids []int, keep func(*tensor.Tensor), logits bool) error {
+// with keep, which reads every layer's input). What capture selects is
+// computed into its own room in s.captured instead of the scratch buffers the
+// next layer overwrites, so capturing needs no more dispatches or round trips.
+func (s *gpuState) chunk(pos int, ids []int, keep func(*tensor.Tensor), capture *capturePlan, logits bool) error {
 	c, g := s.m.Config, s.m.gpu
 	k := g.gpu.Kernels
 	n, h, ff := len(ids), c.HiddenSize, c.IntermediateSize
@@ -271,6 +279,11 @@ func (s *gpuState) chunk(pos int, ids []int, keep func(*tensor.Tensor), logits b
 	width := qDim + 2*kvDim
 	if err := s.reserve(n, pos+n); err != nil {
 		return err
+	}
+	if capture != nil {
+		if err := s.reserveCapture(n * capture.width); err != nil {
+			return err
+		}
 	}
 	for i, id := range ids {
 		metal.Slice[int32](s.ids)[i] = int32(id)
@@ -285,6 +298,15 @@ func (s *gpuState) chunk(pos int, ids []int, keep func(*tensor.Tensor), logits b
 		k.Linear(cb, dst, out, src, in, n, w)
 	}
 	view := func() *tensor.Tensor { return tensor.FromData(metal.Slice[float32](s.x)[:n*h], n, h) }
+	next := 0 // floats of s.captured taken
+	dst := func(mask uint8, p Point, scratch metal.Ref) metal.Ref {
+		if mask&(1<<p) == 0 {
+			return scratch
+		}
+		r := s.captured.At(4 * next) // aligned to 16 bytes: rows are multiples of 4 floats
+		next += n * c.captureCols(p)
+		return r
+	}
 
 	cb := g.gpu.Device.NewCommandBuffer()
 	k.Embed(cb, x, g.embed, g.embedType, s.ids.At(0), c.VocabSize, n, h)
@@ -303,17 +325,24 @@ func (s *gpuState) chunk(pos int, ids []int, keep func(*tensor.Tensor), logits b
 			kq := s.qkv.At(4 * qDim)
 			k.RMSNorm(cb, kq, kq, l.kNorm, width, n, c.NumKeyValueHeads, c.HeadDim, eps)
 		}
+		yAttn, act, yMLP := y, s.act.At(0), y
+		if capture != nil {
+			mask := capture.masks[i]
+			yAttn = dst(mask, AttentionOut, y)
+			act = dst(mask, SwiGLUOut, act)
+			yMLP = dst(mask, MLPOut, y)
+		}
 		k.RoPE(cb, qkv, s.cos.At(0), s.sin.At(0), width, n, c.NumAttentionHeads+c.NumKeyValueHeads, c.HeadDim)
 		k.KVAppend(cb, s.caches[i], s.qkv.At(4*qDim), s.qkv.At(4*(qDim+kvDim)), width, n, pos)
 		k.Attend(cb, ctx, qDim, qkv, width, s.caches[i], n, metal.AttendArgs{Heads: c.NumAttentionHeads, Scale: scale, Causal: true, Offset: pos})
-		linear(cb, y, ctx, l.out, h, qDim)
-		k.Add(cb, x, y, n*h)
+		linear(cb, yAttn, ctx, l.out, h, qDim)
+		k.Add(cb, x, yAttn, n*h)
 
 		k.RMSNorm(cb, hb, x, l.ffNorm, h, n, 1, h, eps)
 		linear(cb, s.gateUp.At(0), hb, l.gateUp, 2*ff, h)
-		k.SwiGLU(cb, s.act.At(0), s.gateUp.At(0), n, ff)
-		linear(cb, y, s.act.At(0), l.down, h, ff)
-		k.Add(cb, x, y, n*h)
+		k.SwiGLU(cb, act, s.gateUp.At(0), n, ff)
+		linear(cb, yMLP, act, l.down, h, ff)
+		k.Add(cb, x, yMLP, n*h)
 	}
 	k.RMSNorm(cb, x, x, g.norm, h, n, 1, h, eps)
 	if logits {
@@ -325,7 +354,40 @@ func (s *gpuState) chunk(pos int, ids []int, keep func(*tensor.Tensor), logits b
 	if keep != nil {
 		keep(view())
 	}
+	if capture != nil {
+		s.reportCapture(capture, pos, n)
+	}
 	return nil
+}
+
+// reserveCapture makes room for floats values in s.captured.
+func (s *gpuState) reserveCapture(floats int) error {
+	if s.captured != nil && s.captured.Len() >= 4*floats {
+		return nil
+	}
+	if s.captured != nil {
+		s.captured.Release()
+		s.captured = nil
+	}
+	var err error
+	s.captured, err = s.m.gpu.gpu.Device.NewBuffer(4 * floats)
+	return err
+}
+
+// reportCapture hands capture the n rows chunk left in s.captured, walking it
+// in the order chunk laid it out, which is the order the CPU reports in.
+func (s *gpuState) reportCapture(capture *capturePlan, pos, n int) {
+	values := metal.Slice[float32](s.captured)
+	next := 0
+	for i := range capture.masks {
+		for _, p := range capturePoints {
+			cols := s.m.Config.captureCols(p)
+			if capture.masks[i]&(1<<p) != 0 {
+				capture.report(i, p, pos, tensor.FromData(values[next:next+n*cols], n, cols))
+				next += n * cols
+			}
+		}
+	}
 }
 
 // logitsInto sets out [rows, vocab] to the output layer on y [rows, hidden],

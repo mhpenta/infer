@@ -1,10 +1,12 @@
-// Package safetensors reads model weights stored in the safetensors format.
+// Package safetensors reads and writes model weights stored in the
+// safetensors format.
 //
 // The format is an 8-byte little-endian header length, a JSON header mapping
 // tensor names to dtype, shape and byte offsets, then the raw tensor bytes.
 // Files are memory-mapped read-only: F32 tensors are returned as zero-copy
 // views into the mapping, and F16/BF16 tensors are upcast to new float32
-// slices. Views stay valid until Close, and writing to one faults.
+// slices. Views stay valid until Close, and writing to one faults. Write
+// writes F32 and BF16 tensors.
 package safetensors
 
 import (
