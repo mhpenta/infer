@@ -173,9 +173,9 @@ func baseRuns(t *testing.T, base string, c modelCase, devices []string) map[stri
 	return runs
 }
 
-// heldTypes returns how the model holds layer 3's o_proj and its gate and up
-// stack: "bf16" or "f32", whichever device it is on.
-func heldTypes(m *Model) (out, gateUp string) {
+// heldTypes returns how the model holds layer 3's o_proj, its gate and up
+// stack and its q, k and v stack: "bf16" or "f32", whichever device it is on.
+func heldTypes(m *Model) (out, gateUp, qkv string) {
 	name := func(bf16 bool) string {
 		if bf16 {
 			return "bf16"
@@ -183,9 +183,11 @@ func heldTypes(m *Model) (out, gateUp string) {
 		return "f32"
 	}
 	if g := m.gpu; g != nil {
-		return g.layers[3].out.Type.String(), g.layers[3].gateUp.Type.String()
+		l := g.layers[3]
+		return l.out.Type.String(), l.gateUp.Type.String(), l.qkv.Type.String()
 	}
-	return name(m.layers[3].out.BF16()), name(m.layers[3].gateUp.BF16())
+	l := m.layers[3]
+	return name(l.out.BF16()), name(l.gateUp.BF16()), name(l.qkv.BF16())
 }
 
 // TestEditedUnchanged loads deltas that hold base tensors' own values, with
@@ -196,13 +198,11 @@ func heldTypes(m *Model) (out, gateUp string) {
 //
 //   - A BF16 delta changes nothing: Metal runs it, and logits are bit-identical
 //     to the base model's on both devices.
-//   - An F32 delta that covers whole stacks runs on both devices, and Auto
-//     stays on Metal. The layer runs on its float32 kernels, whose logits
-//     agree with the bf16 kernels' (on Apple silicon, bit for bit).
-//   - An F32 delta covering only part of a stack (gate without up, q without
-//     k and v) cannot run on Metal: asking for it fails, and Auto silently
-//     runs on the CPU, whose logits differ from the base model's on Metal
-//     within float32 rounding, though no weight changed.
+//   - An F32 delta runs on both devices, and Auto stays on Metal. Each layer
+//     it covers runs on its float32 kernels, whose logits agree with the bf16
+//     kernels' (on Apple silicon, bit for bit). A delta covering only part of
+//     a stack (gate without up, q without k and v) makes the whole stack
+//     float32, on the GPU as on the CPU.
 func TestEditedUnchanged(t *testing.T) {
 	base := golden.ModelDir(t, "INFER_MINICPM5_DIR", "minicpm5-1b")
 	_, cases, _ := miniCPM.load(t)
@@ -220,20 +220,19 @@ func TestEditedUnchanged(t *testing.T) {
 	for _, tt := range []struct {
 		name, dtype string
 		names       []string
-		out, gateUp string // how the CPU and Metal hold layer 3's weights
-		partial     bool   // covers part of a stack: no Metal
-		long        bool   // writes over a gigabyte: skipped with -short
+		held        [3]string // how the CPU and Metal hold layer 3's o_proj, gate|up and q|k|v
+		long        bool      // writes over a gigabyte: skipped with -short
 	}{
-		{"bf16_o_proj", "BF16", []string{o}, "bf16", "bf16", false, false},
-		{"bf16_gate_of_stack", "BF16", []string{gate}, "bf16", "bf16", false, false},
-		{"bf16_every_kind", "BF16", every, "bf16", "bf16", false, false},
-		{"f32_o_proj", "F32", []string{o}, "f32", "bf16", false, false},
-		{"f32_gate_up", "F32", []string{gate, up}, "bf16", "f32", false, false},
-		{"f32_qkv", "F32", []string{q, k, v}, "bf16", "bf16", false, false},
-		{"f32_every_kind", "F32", every, "f32", "f32", false, true},
-		{"f32_gate_of_stack", "F32", []string{gate}, "bf16", "f32", true, false},
-		{"f32_up_of_stack", "F32", []string{up}, "bf16", "f32", true, false},
-		{"f32_q_of_stack", "F32", []string{q}, "bf16", "bf16", true, false},
+		{"bf16_o_proj", "BF16", []string{o}, [3]string{"bf16", "bf16", "bf16"}, false},
+		{"bf16_gate_of_stack", "BF16", []string{gate}, [3]string{"bf16", "bf16", "bf16"}, false},
+		{"bf16_every_kind", "BF16", every, [3]string{"bf16", "bf16", "bf16"}, false},
+		{"f32_o_proj", "F32", []string{o}, [3]string{"f32", "bf16", "bf16"}, false},
+		{"f32_gate_up", "F32", []string{gate, up}, [3]string{"bf16", "f32", "bf16"}, false},
+		{"f32_qkv", "F32", []string{q, k, v}, [3]string{"bf16", "bf16", "f32"}, false},
+		{"f32_every_kind", "F32", every, [3]string{"f32", "f32", "f32"}, true},
+		{"f32_gate_of_stack", "F32", []string{gate}, [3]string{"bf16", "f32", "bf16"}, false},
+		{"f32_up_of_stack", "F32", []string{up}, [3]string{"bf16", "f32", "bf16"}, false},
+		{"f32_q_of_stack", "F32", []string{q}, [3]string{"bf16", "bf16", "f32"}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.long && testing.Short() {
@@ -242,16 +241,6 @@ func TestEditedUnchanged(t *testing.T) {
 			dir := editedDir(t, base, tt.dtype, nil, tt.names...)
 			for _, device := range append(slices.Clone(devices), accel.Auto) {
 				m, err := LoadWith(dir, Options{Device: device})
-				if device == accel.Metal && tt.partial {
-					if err == nil || !strings.Contains(err.Error(), "all of one type when stacked") {
-						t.Errorf("Metal with part of a stack in F32: %v", err)
-					}
-					if err == nil {
-						m.Close()
-					}
-					t.Logf("%-5s fails: %v", device, err)
-					continue
-				}
 				if err != nil {
 					t.Fatalf("%s: %v", device, err)
 				}
@@ -260,26 +249,23 @@ func TestEditedUnchanged(t *testing.T) {
 				if device == accel.Auto {
 					wantOn, cmpDevice = accel.CPU, accel.CPU
 					if haveMetal {
-						cmpDevice = accel.Metal // what Auto gives the base model
-						if !tt.partial {
-							wantOn = accel.Metal
-						}
+						wantOn, cmpDevice = accel.Metal, accel.Metal
 					}
 				}
 				if !strings.HasPrefix(m.Device(), wantOn) {
 					t.Errorf("%s: runs on %s, want %s", device, m.Device(), wantOn)
 				}
-				out, gateUp := heldTypes(m)
-				if out != tt.out || gateUp != tt.gateUp {
-					t.Errorf("%s: holds o_proj in %s and gate|up in %s, want %s and %s", device, out, gateUp, tt.out, tt.gateUp)
+				out, gateUp, qkv := heldTypes(m)
+				if held := [3]string{out, gateUp, qkv}; held != tt.held {
+					t.Errorf("%s: holds o_proj, gate|up and q|k|v in %v, want %v", device, held, tt.held)
 				}
 				got := generateRun(t, m, c.InputIDs, len(c.OutputIDs))
 				if !slices.Equal(got.tokens, c.OutputIDs) {
 					t.Errorf("%s: generated %v, want %v", device, got.tokens, c.OutputIDs)
 				}
 				bits, worst := got.diff(runs[cmpDevice])
-				t.Logf("%-5s on %-22s o_proj %-4s gate|up %-4s: %d logits differ from the base model's on %s, by at most %.3g of a row's range",
-					device, m.Device(), out, gateUp, bits, cmpDevice, worst)
+				t.Logf("%-5s on %-22s o_proj %-4s gate|up %-4s q|k|v %-4s: %d logits differ from the base model's on %s, by at most %.3g of a row's range",
+					device, m.Device(), out, gateUp, qkv, bits, cmpDevice, worst)
 				if worst > relTol {
 					t.Errorf("%s: logits differ from the base model's by %.3g of a row's range", device, worst)
 				}
@@ -295,8 +281,7 @@ func TestEditedUnchanged(t *testing.T) {
 // scripts/dump_golden_llama_hooks.py through the layout of editedDir, on each
 // device and in both dtypes, for a checkpoint with one shard and one with two
 // and tied embeddings. The tokens and logits must be what transformers gets
-// from the same edit in memory, and not what the base model gets. F32 edits of
-// one tensor of a stack have no Metal to run on.
+// from the same edit in memory, and not what the base model gets.
 func TestEditedMatchesPython(t *testing.T) {
 	for _, g := range goldenModels {
 		t.Run(g.dir, func(t *testing.T) {
@@ -307,20 +292,12 @@ func TestEditedMatchesPython(t *testing.T) {
 			c := cases[h.EditCase]
 			for e, edit := range h.Edits {
 				names := slices.Sorted(maps.Keys(edit.Scales))
-				partial := len(names) == 1 && strings.Contains(names[0], "gate_proj")
 				for _, dtype := range []string{"BF16", "F32"} {
 					t.Run(edit.Name+"/"+dtype, func(t *testing.T) {
 						dir := editedDir(t, base, dtype, edit.Scales, names...)
 						values, indices := topKEdit(t, want, e, len(c.InputIDs)+len(edit.OutputIDs)-1)
 						for _, device := range testDevices(t) {
 							m, err := LoadWith(dir, Options{Device: device})
-							if device == accel.Metal && partial && dtype == "F32" {
-								if err == nil {
-									m.Close()
-									t.Error("Metal ran an F32 edit of one tensor of a stack")
-								}
-								continue
-							}
 							if err != nil {
 								t.Fatalf("%s: %v", device, err)
 							}

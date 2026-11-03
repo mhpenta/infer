@@ -192,9 +192,9 @@ type Options struct {
 	// Device. Asking for Metal when it doesn't suit is an error that says why.
 	//
 	// A checkpoint can mix dtypes between tensors, as a bf16 model edited
-	// with float32 tensors does. The CPU takes any mix. The GPU keeps each
-	// linear layer's own dtype, but q, k and v, and gate and up, are one
-	// stacked layer to it, which fails when only some of them are float32.
+	// with float32 tensors does, and both devices take any mix. Each linear
+	// layer keeps its own dtype, except that q, k and v, and gate and up, are
+	// one stacked layer, held in float32 when its parts' dtypes differ.
 	Device string
 }
 

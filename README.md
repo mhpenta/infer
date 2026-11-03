@@ -138,19 +138,16 @@ No file may be called `model.safetensors`: the loader prefers that file and
 never reads the index, so the delta would be silently ignored.
 
 Store a bf16 model's edits as BF16 when they can be: nothing else about the
-model changes. An F32 delta keeps precision bf16 would round away, but how it
-runs depends on what it covers:
+model changes. An F32 delta keeps precision bf16 would round away, and runs on
+either device (`accel.Auto` stays on the GPU), at the cost of float32 memory
+and bandwidth for the layers it covers. Both devices stack `q_proj`, `k_proj`
+and `v_proj` into one layer, and `gate_proj` and `up_proj` into another, so an
+F32 delta covering part of a stack (`gate_proj` without `up_proj`, say) makes
+that whole stack float32.
 
-| Delta | CPU | `accel.Metal` | `accel.Auto` on Apple silicon |
-|-------|-----|---------------|-------------------------------|
-| BF16, any tensors | runs | runs | Metal |
-| F32, a whole layer: `o_proj`, `down_proj`, or a norm, the embeddings or `lm_head` | runs | runs | Metal |
-| F32, a whole stack: `gate_proj` and `up_proj`, or `q_proj`, `k_proj` and `v_proj` | runs | runs | Metal |
-| F32, part of a stack: `gate_proj` without `up_proj`, say | runs | fails, saying why | **the CPU, silently** |
-
-`Model.Device` says where a model ended up. Check it when comparing an edited
-model with its base under `Auto`: the devices sum in different orders, so
-logits differ within float32 rounding even when no weight changed.
+A delta of unchanged values, BF16 or F32, gives logits bit-identical to the base
+model's on the same device. Across devices they differ within float32 rounding,
+so when comparing an edited model with its base, check `Model.Device` on both.
 
 ## How the matrix products work
 

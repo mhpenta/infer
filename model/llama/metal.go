@@ -18,7 +18,8 @@ import (
 // Weights are copied once at load into GPU buffers (model/internal/gpu),
 // row-major as the checkpoint stores them, with q|k|v and gate|up stacked by
 // placing them back to back; nothing is packed. They keep their stored
-// dtype (bf16, fp16 or float32), or, with Options.Int8, the linear layers
+// dtype (bf16, fp16 or float32; a stack whose parts differ is widened to
+// float32, as the CPU packs it), or, with Options.Int8, the linear layers
 // and the output layer are quantized as on the CPU (ops.QuantizeInt8, the
 // same integers and scales as ops.PackInt8); the embeddings keep their
 // dtype either way. Each forward pass is one command buffer
