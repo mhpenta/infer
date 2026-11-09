@@ -8,8 +8,10 @@
 // Every product runs in float32. Weights stored as bf16 stay bf16 in memory
 // (packed with ops.PackBF16 and widened in the kernels, so results are the
 // same as with float32 weights), which halves memory and the bandwidth each
-// generated token needs. LoadWith can instead quantize the weights to int8
-// (Options.Int8), halving them again at a small, measured cost in accuracy.
+// generated token needs; so do weights stored as fp16 where a SIMD kernel
+// widens them (ops.HalfPanels), and elsewhere they are held in float32.
+// LoadWith can instead quantize the weights to int8 (Options.Int8), halving
+// them again at a small, measured cost in accuracy.
 //
 // On Apple silicon the model can run on the GPU instead (Options.Device,
 // metal.go): by default it does when the GPU is available and suits the
@@ -386,6 +388,14 @@ func (m *Model) Close() error {
 	return errors.Join(errs...)
 }
 
+// checkPrompt checks a generation's arguments.
+func (m *Model) checkPrompt(ids []int, maxNew int) error {
+	if maxNew < 0 {
+		return fmt.Errorf("llama: maxNew %d is negative", maxNew)
+	}
+	return m.checkIDs(ids)
+}
+
 func (m *Model) checkIDs(ids []int) error {
 	if len(ids) == 0 {
 		return errors.New("llama: no input ids")
@@ -433,7 +443,8 @@ func (m *Model) LogitsInto(out, y *tensor.Tensor) {
 
 // Generate decodes greedily after ids (the prompt, already tokenized with
 // any special tokens) and returns the new tokens: up to maxNew, ending with
-// an end token (Config.EOS) if one is produced.
+// an end token (Config.EOS) if one is produced. A maxNew of 0 runs the
+// prompt and returns nothing; a negative one is an error.
 func (m *Model) Generate(ids []int, maxNew int) ([]int, error) {
 	var out []int
 	err := m.GenerateFunc(ids, maxNew, func(token int, _ []float32) bool {
@@ -453,9 +464,10 @@ func (m *Model) GenerateFunc(ids []int, maxNew int, fn func(token int, logits []
 // GenerateWith is GenerateFunc choosing each token with s instead of
 // greedily (a nil s is greedy): s sees the prompt and every token generated
 // so far, for its repetition penalty. fn receives the model's logits, before
-// any of s's processing.
+// any of s's processing. It fails if s cannot choose from the logits
+// (sample.ErrNotFinite).
 func (m *Model) GenerateWith(ids []int, maxNew int, s *sample.Sampler, fn func(token int, logits []float32) bool) error {
-	if err := m.checkIDs(ids); err != nil {
+	if err := m.checkPrompt(ids, maxNew); err != nil {
 		return err
 	}
 	st := m.newState(len(ids) + maxNew)
@@ -490,7 +502,7 @@ func (m *Model) NewSession() *Session {
 
 // GenerateWith is Model.GenerateWith reusing the session's cache.
 func (s *Session) GenerateWith(ids []int, maxNew int, smp *sample.Sampler, fn func(token int, logits []float32) bool) error {
-	if err := s.m.checkIDs(ids); err != nil {
+	if err := s.m.checkPrompt(ids, maxNew); err != nil {
 		return err
 	}
 	n := 0
@@ -514,7 +526,8 @@ func (s *Session) Reused() int { return s.reused }
 func (s *Session) Close() { s.st.release() }
 
 // generate runs the part of prompt not yet in the caches, which hold a
-// prefix of it, then decodes up to maxNew tokens.
+// prefix of it, then decodes up to maxNew tokens. The last token generated
+// never runs: nothing would read its logits.
 func (st *state) generate(prompt []int, maxNew int, s *sample.Sampler, fn func(token int, logits []float32) bool) error {
 	defer runtime.KeepAlive(st) // the GPU's logits are st's memory
 	seq := slices.Grow(slices.Clone(prompt), maxNew)
@@ -522,15 +535,15 @@ func (st *state) generate(prompt []int, maxNew int, s *sample.Sampler, fn func(t
 	if err != nil {
 		return err
 	}
-	for range maxNew {
+	for step := range maxNew {
 		var token int
 		if s == nil {
 			token = ops.Argmax(logits)
-		} else {
-			token = s.Next(logits, seq)
+		} else if token, err = s.Next(logits, seq); err != nil {
+			return fmt.Errorf("llama: %w", err)
 		}
 		seq = append(seq, token)
-		if !fn(token, logits) || slices.Contains(st.m.Config.EOS, token) {
+		if !fn(token, logits) || slices.Contains(st.m.Config.EOS, token) || step == maxNew-1 {
 			return nil
 		}
 		if logits, err = st.next([]int{token}); err != nil {
@@ -716,7 +729,9 @@ func (l *loader) tensor(name string, shape ...int) *tensor.Tensor {
 
 // pack packs a linear weight as int8 when the loader quantizes, and
 // otherwise in the storage of its source tensors: bf16 or fp16 panels when
-// they all share that dtype, float32 otherwise.
+// they all share that dtype, float32 otherwise. fp16 panels are only used
+// where a SIMD kernel widens them: without one (on arm64) the portable kernel
+// converts every value, at a small fraction of the float32 kernels' speed.
 func (l *loader) pack(w *tensor.Tensor, names ...string) *ops.Packed {
 	if l.err != nil {
 		return nil
@@ -732,10 +747,10 @@ func (l *loader) pack(w *tensor.Tensor, names ...string) *ops.Packed {
 	}
 	var p *ops.Packed
 	var err error
-	switch dtype {
-	case "BF16":
+	switch {
+	case dtype == "BF16":
 		p, err = ops.PackBF16(w)
-	case "F16":
+	case dtype == "F16" && useHalfPanels():
 		p, err = ops.PackHalf(w)
 	default:
 		p = ops.Pack(w)
@@ -745,6 +760,10 @@ func (l *loader) pack(w *tensor.Tensor, names ...string) *ops.Packed {
 	}
 	return p
 }
+
+// useHalfPanels reports whether to keep F16 weights in fp16 panels. It is a
+// variable so tests can pack both ways.
+var useHalfPanels = ops.HalfPanels
 
 // linear loads an nn.Linear weight [out, in].
 func (l *loader) linear(name string, out, in int) *ops.Packed {

@@ -12,7 +12,8 @@
 //  5. Split on whitespace, and isolate every punctuation character.
 //  6. WordPiece each word, with "##" marking word continuations; words that
 //     cannot be covered, or are over 100 characters, become [UNK].
-//  7. Truncate to MaxLength-2 and wrap in [CLS] ... [SEP].
+//  7. Truncate to MaxLength-2, if there is a MaxLength, and wrap in
+//     [CLS] ... [SEP].
 package wordpiece
 
 import (
@@ -41,7 +42,7 @@ type Config struct {
 	// strip_accents is unset (do_lower_case in tokenizer_config.json).
 	Lowercase bool
 	// MaxLength is the maximum sequence length including [CLS] and [SEP]
-	// (model_max_length in tokenizer_config.json).
+	// (model_max_length in tokenizer_config.json); 0 means no limit.
 	MaxLength int
 }
 
@@ -57,7 +58,7 @@ type Tokenizer struct {
 
 // Load reads a vocab.txt (one token per line, id = line number).
 func Load(vocabPath string, config Config) (*Tokenizer, error) {
-	if config.MaxLength < 2 {
+	if config.MaxLength != 0 && config.MaxLength < 2 {
 		return nil, fmt.Errorf("wordpiece: MaxLength %d leaves no room for [CLS] and [SEP]", config.MaxLength)
 	}
 	f, err := os.Open(vocabPath)
@@ -91,15 +92,17 @@ func Load(vocabPath string, config Config) (*Tokenizer, error) {
 }
 
 // LoadDir loads vocab.txt and reads do_lower_case and model_max_length from
-// tokenizer_config.json in a model directory.
+// tokenizer_config.json in a model directory. A model_max_length that is
+// missing, or the huge number transformers writes for a tokenizer without
+// one, means no limit.
 func LoadDir(dir string) (*Tokenizer, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "tokenizer_config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("wordpiece: %w", err)
 	}
 	var tc struct {
-		DoLowerCase    *bool `json:"do_lower_case"`
-		ModelMaxLength int   `json:"model_max_length"`
+		DoLowerCase    *bool   `json:"do_lower_case"`
+		ModelMaxLength float64 `json:"model_max_length"` // transformers writes 1e30 for no limit
 	}
 	if err := json.Unmarshal(raw, &tc); err != nil {
 		return nil, fmt.Errorf("wordpiece: parse tokenizer_config.json: %w", err)
@@ -107,7 +110,14 @@ func LoadDir(dir string) (*Tokenizer, error) {
 	if tc.DoLowerCase == nil {
 		return nil, errors.New("wordpiece: tokenizer_config.json has no do_lower_case")
 	}
-	return Load(filepath.Join(dir, "vocab.txt"), Config{Lowercase: *tc.DoLowerCase, MaxLength: tc.ModelMaxLength})
+	config := Config{Lowercase: *tc.DoLowerCase}
+	if tc.ModelMaxLength < 0 {
+		return nil, fmt.Errorf("wordpiece: model_max_length %g is negative", tc.ModelMaxLength)
+	}
+	if tc.ModelMaxLength < 1<<30 {
+		config.MaxLength = int(tc.ModelMaxLength)
+	}
+	return Load(filepath.Join(dir, "vocab.txt"), config)
 }
 
 // Encode returns the input ids for text, including [CLS] and [SEP].
@@ -124,7 +134,9 @@ func (t *Tokenizer) Encode(text string) []int {
 		ids = append(ids, t.special[token])
 		text = text[pos+len(token):]
 	}
-	ids = ids[:min(len(ids), t.config.MaxLength-2)]
+	if t.config.MaxLength > 0 {
+		ids = ids[:min(len(ids), t.config.MaxLength-2)]
+	}
 	return append(append([]int{t.clsID}, ids...), t.sepID)
 }
 

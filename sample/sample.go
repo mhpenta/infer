@@ -124,28 +124,39 @@ func New(c Config, seed uint64) (*Sampler, error) {
 // Config returns the sampler's settings.
 func (s *Sampler) Config() Config { return s.c }
 
+// ErrNotFinite is returned by Next for logits it cannot sample from: every
+// one NaN or -Inf, or the largest +Inf, as a model that has overflowed
+// produces (or a temperature so small that dividing by it overflows). A NaN
+// among finite logits is never chosen.
+var ErrNotFinite = errors.New("sample: the logits have no finite maximum")
+
 // Next chooses the token to follow seq (the prompt and every token generated
 // so far, which the repetition penalty looks at) from the model's logits for
-// it. logits is not modified.
-func (s *Sampler) Next(logits []float32, seq []int) int {
+// it. logits is not modified. Sampling fails with ErrNotFinite when the
+// logits leave nothing to sample from; greedy decoding always chooses.
+func (s *Sampler) Next(logits []float32, seq []int) (int, error) {
 	tokens, probs := s.distribution(logits, seq)
-	if len(tokens) == 1 {
-		return tokens[0]
+	switch len(tokens) {
+	case 0:
+		return 0, ErrNotFinite
+	case 1:
+		return tokens[0], nil
 	}
 	u := s.rng.Float64()
 	cum := 0.0
 	for i, p := range probs {
 		if cum += p; u < cum {
-			return tokens[i]
+			return tokens[i], nil
 		}
 	}
-	return tokens[len(tokens)-1] // u beyond a sum rounded below 1
+	return tokens[len(tokens)-1], nil // u beyond a sum rounded below 1
 }
 
 // distribution returns the tokens Next can choose for these logits and their
-// probabilities, which sum to 1: one token when greedy. When top-p is active
-// the tokens come most likely first; otherwise in vocabulary order. The
-// slices are scratch, valid until the next call.
+// probabilities, which sum to 1: one token when greedy, and none when
+// sampling from logits without a finite maximum. When top-p is active the
+// tokens come most likely first; otherwise in vocabulary order. The slices
+// are scratch, valid until the next call.
 func (s *Sampler) distribution(logits []float32, seq []int) ([]int, []float64) {
 	scores := append(s.scores[:0], logits...)
 	s.scores = scores
@@ -180,6 +191,12 @@ func (s *Sampler) distribution(logits []float32, seq []int) ([]int, []float64) {
 		if v >= floor {
 			peak = max(peak, v)
 		}
+	}
+	if math.IsInf(float64(peak), 0) {
+		// Nothing but NaN and -Inf, or a +Inf, which would make every
+		// probability NaN.
+		s.tokens, s.probs = tokens, probs
+		return tokens, probs
 	}
 	total := 0.0
 	for i, v := range scores {
@@ -226,11 +243,12 @@ func (s *Sampler) penalize(scores []float32, seq []int) {
 
 // kthLargest returns the k-th largest value of x (1 <= k < len(x)), keeping
 // the k largest seen so far sorted in a small buffer; most values fall below
-// its minimum and cost one comparison.
+// its minimum and cost one comparison. NaNs do not count, and with fewer
+// than k other values the result is -Inf, which keeps them all.
 func kthLargest(x []float32, k int) float32 {
 	top := make([]float32, 0, k) // descending
 	for _, v := range x {
-		if len(top) == k && v <= top[k-1] {
+		if v != v || len(top) == k && v <= top[k-1] {
 			continue
 		}
 		i, _ := slices.BinarySearchFunc(top, v, func(a, b float32) int {
@@ -244,6 +262,9 @@ func kthLargest(x []float32, k int) float32 {
 		}
 		copy(top[i+1:], top[i:len(top)-1])
 		top[i] = v
+	}
+	if len(top) < k {
+		return float32(math.Inf(-1))
 	}
 	return top[k-1]
 }

@@ -74,18 +74,25 @@ func parse(raw []byte) (*File, error) {
 		if err := json.Unmarshal(msg, &e); err != nil {
 			return nil, fmt.Errorf("tensor %q: %w", name, err)
 		}
-		size, ok := dtypeSize(e.DType)
-		if !ok {
-			// Kept so Names lists it; Tensor reports the unsupported dtype.
-			entries[name] = e
-			continue
-		}
+		// Every entry's offsets are checked, so that Tensor, Bytes and Ints
+		// can slice the data without looking again.
 		start, end := e.Offsets[0], e.Offsets[1]
 		if start < 0 || end < start || end > int64(len(data)) {
 			return nil, fmt.Errorf("tensor %q: offsets %v outside data of %d bytes", name, e.Offsets, len(data))
 		}
-		if want := int64(numel(e.Shape) * size); end-start != want {
-			return nil, fmt.Errorf("tensor %q: %s %v needs %d bytes, offsets give %d", name, e.DType, e.Shape, want, end-start)
+		n, ok := checkedNumel(e.Shape)
+		if !ok {
+			return nil, fmt.Errorf("tensor %q: shape %v has a negative dimension or too many values", name, e.Shape)
+		}
+		// A dtype this package does not know has no size to check; the entry
+		// is kept so Names lists it, and Tensor reports the dtype.
+		if size, ok := dtypeSize(e.DType); ok {
+			if n > math.MaxInt/size {
+				return nil, fmt.Errorf("tensor %q: shape %v has too many values", name, e.Shape)
+			}
+			if want := int64(n * size); end-start != want {
+				return nil, fmt.Errorf("tensor %q: %s %v needs %d bytes, offsets give %d", name, e.DType, e.Shape, want, end-start)
+			}
 		}
 		entries[name] = e
 	}
@@ -231,6 +238,19 @@ func numel(shape []int) int {
 		n *= d
 	}
 	return n
+}
+
+// checkedNumel is numel for a shape read from a file: it fails on a negative
+// dimension and on a product that overflows.
+func checkedNumel(shape []int) (int, bool) {
+	n := 1
+	for _, d := range shape {
+		if d < 0 || d > 0 && n > math.MaxInt/d {
+			return 0, false
+		}
+		n *= d
+	}
+	return n, true
 }
 
 func littleEndian() bool {

@@ -2,6 +2,7 @@ package sample
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -74,13 +75,67 @@ func TestMatchesTransformers(t *testing.T) {
 	}
 }
 
+// next is s.Next for logits it can choose from.
+func next(t testing.TB, s *Sampler, logits []float32, seq []int) int {
+	t.Helper()
+	token, err := s.Next(logits, seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
+// TestNotFinite samples from logits that leave nothing to choose from, which
+// must fail rather than panic or loop, and from ones with a NaN among finite
+// values, which is skipped.
+func TestNotFinite(t *testing.T) {
+	nan, inf := float32(math.NaN()), float32(math.Inf(1))
+	for _, cfg := range []Config{
+		{Temperature: 1},
+		{Temperature: 1, TopK: 2},
+		{Temperature: 1, TopP: 0.9},
+		{Temperature: 1, TopK: 2, TopP: 0.9, RepetitionPenalty: 1.1},
+	} {
+		s, err := New(cfg, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, logits := range [][]float32{
+			{nan, nan, nan, nan},
+			{-inf, -inf, -inf, -inf},
+			{1, inf, 2, 3},
+			{nan, -inf, nan, -inf},
+		} {
+			if token, err := s.Next(logits, []int{0}); !errors.Is(err, ErrNotFinite) {
+				t.Errorf("%+v: Next(%v) = %d, %v; want ErrNotFinite", cfg, logits, token, err)
+			}
+		}
+		if got := next(t, s, []float32{nan, -inf, 3, nan}, nil); got != 2 {
+			t.Errorf("%+v: chose %d from one finite logit, want 2", cfg, got)
+		}
+		for range 100 {
+			if got := next(t, s, []float32{nan, 1, 1.5, nan, 2, nan}, nil); got != 1 && got != 2 && got != 4 {
+				t.Fatalf("%+v: chose %d, a NaN", cfg, got)
+			}
+		}
+	}
+	// Greedy decoding compares, so it always has an answer.
+	s, err := New(Config{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := next(t, s, []float32{-inf, -inf, -inf}, nil); got != 0 {
+		t.Errorf("greedy chose %d from equal logits, want 0", got)
+	}
+}
+
 func TestGreedy(t *testing.T) {
 	logits := []float32{1, 5, -2, 5, 4}
 	s, err := New(Config{}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.Next(logits, nil); got != 1 {
+	if got := next(t, s, logits, nil); got != 1 {
 		t.Errorf("greedy chose %d, want 1 (the first of the tied maxima)", got)
 	}
 	// A penalty of 2 turns 5 into 2.5 for tokens 1 and 3, leaving 4 on top.
@@ -88,7 +143,7 @@ func TestGreedy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.Next(logits, []int{3, 1, 1}); got != 4 {
+	if got := next(t, s, logits, []int{3, 1, 1}); got != 4 {
 		t.Errorf("greedy with a penalty chose %d, want 4", got)
 	}
 	if logits[1] != 5 {
@@ -117,7 +172,7 @@ func TestDrawFrequencies(t *testing.T) {
 		const draws = 200_000
 		counts := map[int]int{}
 		for range draws {
-			counts[s.Next(logits, nil)]++
+			counts[next(t, s, logits, nil)]++
 		}
 		chi2 := 0.0
 		for tok, n := range counts {
@@ -147,7 +202,7 @@ func TestSeedReproducible(t *testing.T) {
 		}
 		var out []int
 		for range 50 {
-			out = append(out, s.Next(logits, out))
+			out = append(out, next(t, s, logits, out))
 		}
 		return out
 	}

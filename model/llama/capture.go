@@ -150,7 +150,7 @@ func (m *Model) Capture(ids []int, c Capture) error {
 // token, then each token's single position before fn sees the next. The last
 // token generated never runs, so maxNew tokens give len(ids)+maxNew-1 rows.
 func (m *Model) GenerateCapture(ids []int, maxNew int, s *sample.Sampler, c Capture, fn func(token int, logits []float32) bool) error {
-	if err := m.checkIDs(ids); err != nil {
+	if err := m.checkPrompt(ids, maxNew); err != nil {
 		return err
 	}
 	plan, err := m.plan(c)

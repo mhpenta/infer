@@ -389,18 +389,19 @@ func (m *metaspace) apply(w string, first bool) []string {
 	}
 	var pieces []string
 	for w != "" {
-		next := strings.Index(w[len(m.replacement):], m.replacement)
-		if !strings.HasPrefix(w, m.replacement) {
-			next = strings.Index(w, m.replacement)
-		} else if next >= 0 {
-			next += len(m.replacement)
+		// A piece keeps the replacement it starts with and ends before the
+		// next one.
+		skip := 0
+		if strings.HasPrefix(w, m.replacement) {
+			skip = len(m.replacement)
 		}
-		if next <= 0 {
+		next := strings.Index(w[skip:], m.replacement)
+		if next < 0 {
 			pieces = append(pieces, w)
 			break
 		}
-		pieces = append(pieces, w[:next])
-		w = w[next:]
+		pieces = append(pieces, w[:skip+next])
+		w = w[skip+next:]
 	}
 	return pieces
 }

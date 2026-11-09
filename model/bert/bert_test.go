@@ -192,3 +192,34 @@ func benchMiniLM(b *testing.B, device string) {
 		})
 	}
 }
+
+// TestGPUWorkspacesDoNotAccumulate runs inputs of growing length, each of
+// which outgrows the workspace the one before left free: the model must keep
+// one workspace, not one per length, and reuse it for shorter inputs.
+func TestGPUWorkspacesDoNotAccumulate(t *testing.T) {
+	if len(testDevices(t)) < 2 {
+		t.Skip("needs Metal")
+	}
+	model := loadOn(t, golden.ModelDir(t, "INFER_MINILM_DIR", "all-MiniLM-L6-v2"), accel.Metal)
+	free := func() []int {
+		model.gpu.mu.Lock()
+		defer model.gpu.mu.Unlock()
+		var rows []int
+		for _, w := range model.gpu.workspace {
+			rows = append(rows, w.rows)
+		}
+		return rows
+	}
+	for _, n := range []int{4, 8, 16, 32, 64, 12, 64, 3} {
+		ids := make([]int, n)
+		for i := range ids {
+			ids[i] = 1000 + i
+		}
+		if _, err := model.Forward(ids); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := free(); !slices.Equal(got, []int{64}) {
+		t.Errorf("free workspaces hold %v rows, want one of 64", got)
+	}
+}
