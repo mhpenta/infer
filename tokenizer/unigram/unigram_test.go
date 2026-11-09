@@ -93,3 +93,44 @@ func TestModelCasesTokenizeLikePython(t *testing.T) {
 		}
 	}
 }
+
+// TestMetaspaceWithoutPrefix encodes words Metaspace leaves without its
+// replacement in front (prepend_scheme "never", or "first" after an added
+// token), including ones shorter than the replacement's three bytes.
+func TestMetaspaceWithoutPrefix(t *testing.T) {
+	load := func(scheme string) *Tokenizer {
+		t.Helper()
+		src := `{"added_tokens": [{"id": 4, "content": "<x>", "special": true}],
+			"pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "` + scheme + `", "split": true},
+			"decoder": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "` + scheme + `", "split": true},
+			"model": {"type": "Unigram", "unk_id": 0, "vocab": [["<unk>", 0], ["a", -1], ["▁", -2], ["▁a", -1], ["<x>", 0]]}}`
+		path := filepath.Join(t.TempDir(), "tokenizer.json")
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tok, err := Load(path, Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok
+	}
+	for _, c := range []struct {
+		scheme, text string
+		want         []int
+	}{
+		{"never", "a", []int{1}},
+		{"never", "a a", []int{1, 3}},
+		{"never", " a", []int{3}},
+		{"never", "a ", []int{1, 2}},
+		{"first", "a", []int{3}},
+		{"first", "<x>a", []int{4, 1}},
+		{"first", "<x>a a", []int{4, 1, 3}},
+		{"always", "a", []int{3}},
+		{"always", "<x>a", []int{4, 3}},
+		{"always", "  a", []int{2, 3}}, // "▁▁a" already starts with it
+	} {
+		if got := load(c.scheme).Encode(c.text); !slices.Equal(got, c.want) {
+			t.Errorf("%s: Encode(%q) = %v, want %v", c.scheme, c.text, got, c.want)
+		}
+	}
+}

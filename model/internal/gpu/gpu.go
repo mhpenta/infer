@@ -4,8 +4,9 @@
 // Linear layers keep the dtype the checkpoint stores (bf16, fp16 or float32),
 // or, with int8, are quantized as on the CPU (ops.QuantizeInt8, the same
 // integers and scales as ops.PackInt8). Layers over the same input can be
-// stacked into one, so one product computes all of them. Each model records
-// its own forward pass from these pieces.
+// stacked into one, so one product computes all of them; a stack of layers
+// stored in different dtypes is widened to float32, as the CPU packs it. Each
+// model records its own forward pass from these pieces.
 package gpu
 
 import (
@@ -97,30 +98,39 @@ func stored(dtype string) (metal.WeightType, bool) {
 
 // Linear loads linear layers over the same in inputs, outs[i] outputs each,
 // stacked into one [Σouts, in] layer, with biases (one per weight, or nil
-// for none). The weights stay in their stored dtype, which they must share,
-// or are quantized to int8 row by row (so quantizing then stacking gives the
-// stack's integers).
+// for none). The weights stay in their stored dtype, or in float32 when they
+// do not all share one (a bf16 checkpoint with some layers edited in float32,
+// say), which holds every value exactly, or are quantized to int8 row by row
+// (so quantizing then stacking gives the stack's integers).
 func (l *Loader) Linear(in int, outs []int, weights, biases []string) metal.Weights {
 	total := 0
 	var t metal.WeightType
+	mixed := false
 	for i, name := range weights {
 		f := l.file(name, outs[i], in)
 		if f == nil {
 			return metal.Weights{}
 		}
 		ti, ok := stored(f.DType(l.prefix + name))
-		if !ok || i > 0 && ti != t {
-			l.Err = fmt.Errorf("tensor %s is %s; the GPU takes bf16, fp16 or float32 layers, all of one type when stacked", l.prefix+name, f.DType(l.prefix+name))
+		if !ok {
+			l.Err = fmt.Errorf("tensor %s is %s; the GPU takes bf16, fp16 or float32 layers", l.prefix+name, f.DType(l.prefix+name))
 			return metal.Weights{}
 		}
-		t = ti
+		if i == 0 {
+			t = ti
+		}
+		mixed = mixed || ti != t
 		total += outs[i]
 	}
 	w := metal.Weights{Type: t, N: total, K: in}
-	if l.int8 {
+	switch {
+	case l.int8:
 		w.Type = metal.Int8
 		w.W, w.Scale = l.quantized(in, total, weights)
-	} else {
+	case mixed:
+		w.Type = metal.F32
+		w.W = l.floats(weights, total*in)
+	default:
 		w.W = l.raw(t.Size()*total*in, weights)
 	}
 	if biases != nil {

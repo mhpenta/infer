@@ -28,14 +28,14 @@ checked against the same goldens on both devices; see
 |---------|---|
 | `tensor` | dense, row-major float32 tensors |
 | `ops` | matrix products and the rest of the kernels: LayerNorm, GELU, softmax, attention |
-| `safetensors` | memory-mapped `.safetensors` reader (F32 zero-copy, F16/BF16 upcast) |
+| `safetensors` | memory-mapped `.safetensors` reader (F32 zero-copy, F16/BF16 upcast), and a writer for F32 and BF16 tensors, byte for byte what the Python library's `save_file` writes |
 | `tokenizer/wordpiece` | BERT's tokenizer, matching Hugging Face's fast `BertTokenizer` |
 | `tokenizer/unigram` | SentencePiece Unigram from `tokenizer.json` (T5), including the precompiled NFKC character map |
 | `tokenizer/bpe` | byte-level BPE from `tokenizer.json` (MiniCPM5, Qwen3 and other GPT-2-style tokenizers): NFC normalization, the GPT-4-style split patterns as hand-written scanners |
 | `tokenizer/chat` | chat templates in Go, recognized by the hash of the model's Jinja template (MiniCPM5-1B and -2B, Qwen3), with Qwen3 tool calling: tool definitions, tool calls and responses, and parsing calls from a reply |
 | `model/bert` | the BERT encoder; on Apple silicon, on the GPU by default (`bert.LoadWith(dir, bert.Options{Device: ...})`) |
 | `model/t5` | the T5 encoder-decoder: relative position bias, cross-attention, greedy decoding with a KV cache; on Apple silicon, on the GPU by default (`t5.Options`) |
-| `model/llama` | Llama-family decoders (`LlamaForCausalLM`, `Qwen3ForCausalLM`): grouped-query attention, rotary embeddings, SwiGLU, bf16 or int8 weights (`llama.LoadWith(dir, llama.Options{Int8: true})`), greedy or sampled decoding with a KV cache; on Apple silicon, on the GPU by default, bf16 or int8 (`Options.Device`, `INFER_DEVICE`), checked against the same goldens |
+| `model/llama` | Llama-family decoders (`LlamaForCausalLM`, `Qwen3ForCausalLM`): grouped-query attention, rotary embeddings, SwiGLU, bf16 or int8 weights (`llama.LoadWith(dir, llama.Options{Int8: true})`), greedy or sampled decoding with a KV cache, capture of selected layers' activations during it (`llama.Capture`); on Apple silicon, on the GPU by default, bf16 or int8 (`Options.Device`, `INFER_DEVICE`), checked against the same goldens |
 | `accel` | choosing the device a model runs on: the option, then `INFER_DEVICE`, then auto; opens the GPU once per process and self-checks its kernels against `ops` |
 | `metal` | GPU compute through Apple's Metal, without cgo (through `internal/objc`): devices, run-time compiled kernels, shared buffers, command buffers, and the models' kernels (products over bf16, fp16, float32 or int8 weights, RMSNorm and LayerNorm, RoPE, attention over a key/value cache, causal or not, with an optional bias, SwiGLU, GELU and ReLU, embedding lookup, argmax), each checked against `ops`. Every model in `model/` runs on it; see [GPU inference](docs/accelerator-plan.md) |
 | `sample` | choosing the next token: greedy, or temperature, top-k, top-p and repetition penalty with transformers' meaning and order, defaults read from `generation_config.json`; the distributions match transformers' logits processors |
@@ -86,6 +86,68 @@ err = model.GenerateWith(tok.EncodeRaw(prompt), 512, s, func(token int, _ []floa
 session := model.NewSession()
 err = session.GenerateWith(tok.EncodeRaw(prompt), 512, s, fn)
 ```
+
+### Reading activations
+
+`HiddenStates` gives what enters each layer. A `Capture` reads what each layer
+computes, on the CPU or the GPU, for the layers and points it selects: the
+attention contribution after `o_proj` (`AttentionOut`), the activations between
+SwiGLU and `down_proj` (`SwiGLUOut`), and the feed-forward contribution after
+`down_proj` (`MLPOut`). They match transformers' forward hooks.
+
+```go
+// A whole sequence, keeping copies in a Recording.
+var rec llama.Recording
+err := model.Capture(ids, llama.Capture{Layers: []int{3, 12}, Points: []llama.Point{llama.MLPOut}, Fn: rec.Record})
+mlp, ok := rec.Get(12, llama.MLPOut) // mlp.Values is [len(ids), hidden]
+
+// During generation with the KV cache. Fn sees the model's own memory, valid
+// until it returns, and copies only what it wants: here, one position's norm.
+err = model.GenerateCapture(prompt, 64, nil, llama.Capture{
+	Layers: []int{12},
+	Points: []llama.Point{llama.SwiGLUOut},
+	Fn: func(a llama.Activation) {
+		last := a.Values.Row(a.Values.Rows() - 1) // position a.Start + rows - 1
+		norms = append(norms, norm(last))
+	},
+}, fn)
+
+// In a session, where only positions the cache does not reuse run.
+err = session.SetCapture(&llama.Capture{Points: []llama.Point{llama.AttentionOut}, Fn: rec.Record})
+```
+
+Prompts on the GPU run in chunks of 512 positions, so a long one reaches `Fn`
+in several calls: place rows with `Start`. Without a `Capture` a forward pass
+checks one pointer per layer (see the benchmarks in `model/llama/bench_test.go`).
+
+### Editing weights
+
+`safetensors.Write` and an index let a checkpoint differ from another in a few
+tensors, without copying it. `model.safetensors.index.json` decides where each
+tensor comes from:
+
+```
+edited/
+  config.json, generation_config.json, tokenizer.json, ...   symlinks to the base model
+  base-0.safetensors, ...                                    symlinks to its shards
+  delta.safetensors                                          the edited tensors
+  model.safetensors.index.json                               edited tensors -> delta, the others -> base-N
+```
+
+No file may be called `model.safetensors`: the loader prefers that file and
+never reads the index, so the delta would be silently ignored.
+
+Store a bf16 model's edits as BF16 when they can be: nothing else about the
+model changes. An F32 delta keeps precision bf16 would round away, and runs on
+either device (`accel.Auto` stays on the GPU), at the cost of float32 memory
+and bandwidth for the layers it covers. Both devices stack `q_proj`, `k_proj`
+and `v_proj` into one layer, and `gate_proj` and `up_proj` into another, so an
+F32 delta covering part of a stack (`gate_proj` without `up_proj`, say) makes
+that whole stack float32.
+
+A delta of unchanged values, BF16 or F32, gives logits bit-identical to the base
+model's on the same device. Across devices they differ within float32 rounding,
+so when comparing an edited model with its base, check `Model.Device` on both.
 
 ## How the matrix products work
 
@@ -172,8 +234,10 @@ docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src -e INFER_REQUIRE_A
 
 The reference outputs in `testdata/golden` come from `scripts/dump_golden_bert.py`,
 `scripts/dump_golden_mxbai.py`, `scripts/dump_golden_t5.py`,
-`scripts/dump_golden_llama.py` and `scripts/dump_golden_sample.py` (PyTorch +
-transformers). `benchcmp/` is a
+`scripts/dump_golden_llama.py`, `scripts/dump_golden_llama_hooks.py` and
+`scripts/dump_golden_sample.py` (PyTorch + transformers).
+`scripts/check_safetensors_write.py` checks the writer's files against the
+Python library and PyTorch. `benchcmp/` is a
 separate module comparing the matrix product with gonum and vek.
 
 ## License

@@ -39,6 +39,11 @@ import (
 // library; once full, new pieces are not cached.
 const cacheSize = 10000
 
+// maxTokenID bounds the ids a tokenizer.json may use, far above any real
+// vocabulary: the tables are indexed by id, so a corrupt one would otherwise
+// be a huge allocation.
+const maxTokenID = 1 << 24
+
 // Config controls decoding.
 type Config struct {
 	// CleanUpSpaces removes spaces before punctuation and in English
@@ -134,12 +139,15 @@ func Load(path string, config Config) (*Tokenizer, error) {
 	}
 	size := 0
 	for tok, id := range m.Vocab {
-		if id < 0 {
+		if id < 0 || id > maxTokenID {
 			return nil, fmt.Errorf("bpe: token %q has id %d", tok, id)
 		}
 		size = max(size, id+1)
 	}
 	for _, a := range tj.AddedTokens {
+		if a.ID < 0 || a.ID > maxTokenID {
+			return nil, fmt.Errorf("bpe: added token %q has id %d", a.Content, a.ID)
+		}
 		size = max(size, a.ID+1)
 	}
 	t.tokens = make([]string, size)

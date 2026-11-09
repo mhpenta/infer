@@ -1,7 +1,10 @@
 package bpe
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -227,5 +230,50 @@ func BenchmarkEncode(b *testing.B) {
 	b.SetBytes(int64(len(text)))
 	for b.Loop() {
 		tok.EncodeRaw(text)
+	}
+}
+
+// TestLoadRejectsBadIDs loads the smallest tokenizer.json this package
+// takes (a token per byte, no merges), then ones whose ids cannot index a
+// table: negative, or far beyond any vocabulary.
+func TestLoadRejectsBadIDs(t *testing.T) {
+	load := func(tokenID int, added map[string]any) (*Tokenizer, error) {
+		vocab := map[string]int{"extra": tokenID}
+		for b, r := range byteChars {
+			vocab[string(r)] = b
+		}
+		src, err := json.Marshal(map[string]any{
+			"added_tokens":  []any{added},
+			"pre_tokenizer": map[string]any{"type": "ByteLevel", "add_prefix_space": false, "use_regex": false},
+			"decoder":       map[string]any{"type": "ByteLevel"},
+			"model":         map[string]any{"type": "BPE", "vocab": vocab, "merges": []any{}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "tokenizer.json")
+		if err := os.WriteFile(path, src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Load(path, Config{})
+	}
+	special := func(id int) map[string]any { return map[string]any{"id": id, "content": "<s>", "special": true} }
+
+	tok, err := load(256, special(257))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tok.Encode("<s>hi"); !slices.Equal(got, []int{257, 'h', 'i'}) || tok.VocabSize() != 258 {
+		t.Errorf("Encode gave %v with a vocabulary of %d", got, tok.VocabSize())
+	}
+	for name, bad := range map[string]func() (*Tokenizer, error){
+		"a negative added token id": func() (*Tokenizer, error) { return load(256, special(-1)) },
+		"a huge added token id":     func() (*Tokenizer, error) { return load(256, special(1<<40)) },
+		"a negative token id":       func() (*Tokenizer, error) { return load(-1, special(257)) },
+		"a huge token id":           func() (*Tokenizer, error) { return load(1<<40, special(257)) },
+	} {
+		if _, err := bad(); err == nil || !strings.Contains(err.Error(), "has id") {
+			t.Errorf("%s: Load error = %v, want one about the id", name, err)
+		}
 	}
 }

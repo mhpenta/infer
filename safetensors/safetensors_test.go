@@ -110,6 +110,38 @@ func TestOpenRejectsCorruptFiles(t *testing.T) {
 			data:    make([]byte, 8),
 			wantErr: "needs 12 bytes",
 		},
+		{
+			// Open checks these too, or Bytes and Tensor would slice past the data.
+			name:    "offsets past end, unknown dtype",
+			header:  map[string]any{"x": map[string]any{"dtype": "C64", "shape": []int{2}, "data_offsets": []int{0, 4096}}},
+			data:    make([]byte, 16),
+			wantErr: "outside data",
+		},
+		{
+			name:    "offsets reversed, unknown dtype",
+			header:  map[string]any{"x": map[string]any{"dtype": "C64", "shape": []int{2}, "data_offsets": []int{12, 4}}},
+			data:    make([]byte, 16),
+			wantErr: "outside data",
+		},
+		{
+			name:    "negative dimensions",
+			header:  map[string]any{"x": map[string]any{"dtype": "F32", "shape": []int{-2, -2}, "data_offsets": []int{0, 16}}},
+			data:    make([]byte, 16),
+			wantErr: "negative dimension",
+		},
+		{
+			// (2^62+1)·4 values wrap around to 4.
+			name:    "dimensions that overflow",
+			header:  map[string]any{"x": map[string]any{"dtype": "F32", "shape": []int{1<<62 + 1, 4}, "data_offsets": []int{0, 16}}},
+			data:    make([]byte, 16),
+			wantErr: "too many values",
+		},
+		{
+			// 2^61 float32 values are 2^63 bytes.
+			name:    "bytes that overflow",
+			header:  map[string]any{"x": map[string]any{"dtype": "F32", "shape": []int{1 << 61}, "data_offsets": []int{0, 0}}},
+			wantErr: "too many values",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -158,5 +190,30 @@ func TestInts(t *testing.T) {
 	}
 	if _, _, err := f.Ints("missing"); err == nil {
 		t.Error("Ints of a missing tensor succeeded")
+	}
+}
+
+// TestUnknownDType opens a file holding a dtype this package does not read:
+// the tensor is listed and its bytes are there, and reading it as numbers
+// fails by naming the dtype.
+func TestUnknownDType(t *testing.T) {
+	f, err := Open(writeFile(t, map[string]any{
+		"z": map[string]any{"dtype": "C64", "shape": []int{2}, "data_offsets": []int{0, 16}},
+	}, make([]byte, 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if !slices.Equal(f.Names(), []string{"z"}) || f.DType("z") != "C64" {
+		t.Errorf("Names %v, DType %q", f.Names(), f.DType("z"))
+	}
+	if b, err := f.Bytes("z"); err != nil || len(b) != 16 {
+		t.Errorf("Bytes gave %d bytes, %v", len(b), err)
+	}
+	if _, err := f.Tensor("z"); err == nil || !strings.Contains(err.Error(), "C64") {
+		t.Errorf("Tensor error = %v, want one naming C64", err)
+	}
+	if _, _, err := f.Ints("z"); err == nil || !strings.Contains(err.Error(), "C64") {
+		t.Errorf("Ints error = %v, want one naming C64", err)
 	}
 }

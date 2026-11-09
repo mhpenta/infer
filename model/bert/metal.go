@@ -140,7 +140,9 @@ func (w *gpuWork) release() {
 	}
 }
 
-// work returns a free workspace for rows positions, or makes one.
+// work returns a free workspace for rows positions, or makes one. Making one
+// frees the free ones, all too small: otherwise inputs of growing length
+// would leave a workspace behind for every length.
 func (g *gpuModel) work(c Config, rows int) (*gpuWork, error) {
 	g.mu.Lock()
 	for i, w := range g.workspace {
@@ -150,7 +152,12 @@ func (g *gpuModel) work(c Config, rows int) (*gpuWork, error) {
 			return w, nil
 		}
 	}
+	outgrown := g.workspace
+	g.workspace = nil
 	g.mu.Unlock()
+	for _, w := range outgrown {
+		w.release()
+	}
 	dev, h := g.gpu.Device, c.HiddenSize
 	w := &gpuWork{rows: rows}
 	var errs []error
