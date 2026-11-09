@@ -13,7 +13,7 @@ import (
 // (head dimension 128, theta 5e6) with the ones transformers computed: equal
 // but for at most one that torch's float32 pow rounds the other way.
 func TestRoPEInvFreqMatchesTorch(t *testing.T) {
-	f, err := safetensors.Open(golden.Path("minicpm5_1b_model.safetensors"))
+	f, err := safetensors.Open(golden.Path(t, "minicpm5_1b_model.safetensors"))
 	if err != nil {
 		t.Skip(err)
 	}

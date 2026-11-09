@@ -67,7 +67,7 @@ func checkMiniLM(t *testing.T, device string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := safetensors.Open(golden.Path("minilm_model.safetensors"))
+	want, err := safetensors.Open(golden.Path(t, "minilm_model.safetensors"))
 	if err != nil {
 		t.Fatal(err)
 	}

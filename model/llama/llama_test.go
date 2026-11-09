@@ -128,7 +128,7 @@ func (g goldenModel) load(t testing.TB) (*Model, []modelCase, *safetensors.File)
 		if !slices.Equal(model.Config.EOS, gm.EOS) {
 			t.Fatalf("end tokens %v, want %v", model.Config.EOS, gm.EOS)
 		}
-		want, err := safetensors.Open(golden.Path(g.prefix + "_model.safetensors"))
+		want, err := safetensors.Open(golden.Path(t, g.prefix+"_model.safetensors"))
 		if err != nil {
 			t.Fatal(err)
 		}

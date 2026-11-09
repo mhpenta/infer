@@ -62,7 +62,7 @@ func loadT5(t *testing.T, device string) (*Model, []modelCase, *safetensors.File
 	t.Cleanup(func() { model.Close() })
 	var cases []modelCase
 	golden.JSON(t, "t5small_model.json", &cases)
-	want, err := safetensors.Open(golden.Path("t5small_model.safetensors"))
+	want, err := safetensors.Open(golden.Path(t, "t5small_model.safetensors"))
 	if err != nil {
 		t.Fatal(err)
 	}

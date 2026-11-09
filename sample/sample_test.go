@@ -33,7 +33,7 @@ type goldenCase struct {
 func TestMatchesTransformers(t *testing.T) {
 	var cases []goldenCase
 	golden.JSON(t, "sample.json", &cases)
-	real, err := safetensors.Open(golden.Path("minicpm5_1b_model.safetensors"))
+	real, err := safetensors.Open(golden.Path(t, "minicpm5_1b_model.safetensors"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestNewRejectsBadConfig(t *testing.T) {
 // BenchmarkNext times one draw from real MiniCPM5-1B logits (130,560
 // tokens, of which top-p 0.95 at temperature 1 keeps 598).
 func BenchmarkNext(b *testing.B) {
-	real, err := safetensors.Open(golden.Path("minicpm5_1b_model.safetensors"))
+	real, err := safetensors.Open(golden.Path(b, "minicpm5_1b_model.safetensors"))
 	if err != nil {
 		b.Fatal(err)
 	}

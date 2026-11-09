@@ -22,15 +22,22 @@ func Root() string {
 	return filepath.Join(filepath.Dir(file), "..", "..")
 }
 
-// Path returns a path under testdata/golden.
-func Path(name string) string {
-	return filepath.Join(Root(), "testdata", "golden", name)
+// Path returns a path under testdata/golden. testdata has its own go.mod, so
+// it is left out of the module download: when the tests run from the module
+// cache rather than a clone, the directory is missing and the test is skipped.
+func Path(t testing.TB, name string) string {
+	t.Helper()
+	dir := filepath.Join(Root(), "testdata", "golden")
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		t.Skip("golden files are not part of the module download; run the tests from a clone of the repository")
+	}
+	return filepath.Join(dir, name)
 }
 
 // Cases reads a JSON list of cases from testdata/golden.
 func Cases(t testing.TB, name string) []Case {
 	t.Helper()
-	raw, err := os.ReadFile(Path(name))
+	raw, err := os.ReadFile(Path(t, name))
 	if err != nil {
 		t.Fatalf("read golden cases: %v", err)
 	}
@@ -59,7 +66,7 @@ func ModelDir(t testing.TB, envVar, name string) string {
 // JSON reads testdata/golden/<name> into v.
 func JSON(t testing.TB, name string, v any) {
 	t.Helper()
-	raw, err := os.ReadFile(Path(name))
+	raw, err := os.ReadFile(Path(t, name))
 	if err != nil {
 		t.Fatalf("read golden %s: %v", name, err)
 	}

@@ -64,7 +64,7 @@ func TestMxbaiMatchesPython(t *testing.T) {
 
 func checkMxbai(t *testing.T, device string) {
 	model, tok := loadMxbai(t, device)
-	want, err := safetensors.Open(golden.Path("mxbai_model.safetensors"))
+	want, err := safetensors.Open(golden.Path(t, "mxbai_model.safetensors"))
 	if err != nil {
 		t.Fatal(err)
 	}
