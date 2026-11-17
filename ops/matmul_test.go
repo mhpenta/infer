@@ -145,10 +145,8 @@ func TestKernelMatchesPortable(t *testing.T) {
 			got, want := slices.Clone(start), slices.Clone(start)
 			kernel6x16(&a[0], &b[0], k, &got[0], ldc, &bias[0], mode)
 			kernel6x16Portable(&a[0], &b[0], k, &want[0], ldc, &bias[0], mode)
-			for i := range got {
-				if math.Abs(float64(got[i]-want[i])) > 1e-4*(1+math.Abs(float64(want[i]))) {
-					t.Fatalf("%s kernel, k=%d, mode %d: c[%d] = %g, portable kernel gives %g", Kernel(), k, mode, i, got[i], want[i])
-				}
+			if err := kernelOutputsAgree(got, want, start, ldc, [][]float32{a}, [][]float32{b}, k, bias, mode); err != nil {
+				t.Fatalf("%s kernel, k=%d, mode %d: %v", Kernel(), k, mode, err)
 			}
 		}
 	}

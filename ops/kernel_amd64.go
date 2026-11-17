@@ -4,7 +4,6 @@ package ops
 
 import (
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"strings"
 
@@ -38,7 +37,9 @@ func init() {
 }
 
 // checkWideKernel compares kernel12x32AVX512 with kernel12x32Portable on
-// random data across depths around the unrolling and every epilogue mode.
+// random data across depths around the unrolling and every epilogue mode, for
+// each panel format, allowing the rounding differences kernelOutputsAgree
+// bounds.
 func checkWideKernel() error {
 	r := rand.New(rand.NewPCG(31, 32))
 	const ldc = 2*nr + 3
@@ -50,41 +51,37 @@ func checkWideKernel() error {
 		h0, h1 := randomHalves(r, k*nr), randomHalves(r, k*nr)
 		f0, f1 := randomBF16(r, k*nr), randomBF16(r, k*nr)
 		q0, q1 := randomInt8(r, k*nr), randomInt8(r, k*nr)
+		strips := [][]float32{a0, a1}
 		for _, mode := range []int{storeC, storeBiasC, addC} {
-			got, want := append([]float32(nil), start...), append([]float32(nil), start...)
-			kernel12x32AVX512(&a0[0], &a1[0], &b0[0], &b1[0], k, &got[0], ldc, &bias[0], mode)
-			kernel12x32Portable(&a0[0], &a1[0], &b0[0], &b1[0], k, &want[0], ldc, &bias[0], mode)
-			if err := closeEnough(got, want); err != nil {
-				return fmt.Errorf("k=%d mode=%d: %w", k, mode, err)
+			for _, f := range []struct {
+				name          string
+				panels        [][]float32
+				avx, portable func(c *float32)
+			}{
+				{"float32", [][]float32{b0, b1},
+					func(c *float32) { kernel12x32AVX512(&a0[0], &a1[0], &b0[0], &b1[0], k, c, ldc, &bias[0], mode) },
+					func(c *float32) { kernel12x32Portable(&a0[0], &a1[0], &b0[0], &b1[0], k, c, ldc, &bias[0], mode) }},
+				{"fp16", [][]float32{widenPanel(formatF16, h0), widenPanel(formatF16, h1)},
+					func(c *float32) { kernel12x32AVX512H(&a0[0], &a1[0], &h0[0], &h1[0], k, c, ldc, &bias[0], mode) },
+					func(c *float32) {
+						kernel12x32PortableNarrow(formatF16, &a0[0], &a1[0], &h0[0], &h1[0], k, c, ldc, &bias[0], mode)
+					}},
+				{"bf16", [][]float32{widenPanel(formatBF16, f0), widenPanel(formatBF16, f1)},
+					func(c *float32) { kernel12x32AVX512B(&a0[0], &a1[0], &f0[0], &f1[0], k, c, ldc, &bias[0], mode) },
+					func(c *float32) {
+						kernel12x32PortableNarrow(formatBF16, &a0[0], &a1[0], &f0[0], &f1[0], k, c, ldc, &bias[0], mode)
+					}},
+				{"int8", [][]float32{widenInt8Panel(q0), widenInt8Panel(q1)},
+					func(c *float32) { kernel12x32AVX512I(&a0[0], &a1[0], &q0[0], &q1[0], k, c, ldc, &bias[0], mode) },
+					func(c *float32) { kernel12x32PortableInt8(&a0[0], &a1[0], &q0[0], &q1[0], k, c, ldc, &bias[0], mode) }},
+			} {
+				got, want := append([]float32(nil), start...), append([]float32(nil), start...)
+				f.avx(&got[0])
+				f.portable(&want[0])
+				if err := kernelOutputsAgree(got, want, start, ldc, strips, f.panels, k, bias, mode); err != nil {
+					return fmt.Errorf("%s panels, k=%d mode=%d: %w", f.name, k, mode, err)
+				}
 			}
-			got, want = append(got[:0], start...), append(want[:0], start...)
-			kernel12x32AVX512H(&a0[0], &a1[0], &h0[0], &h1[0], k, &got[0], ldc, &bias[0], mode)
-			kernel12x32PortableNarrow(formatF16, &a0[0], &a1[0], &h0[0], &h1[0], k, &want[0], ldc, &bias[0], mode)
-			if err := closeEnough(got, want); err != nil {
-				return fmt.Errorf("fp16 panels, k=%d mode=%d: %w", k, mode, err)
-			}
-			got, want = append(got[:0], start...), append(want[:0], start...)
-			kernel12x32AVX512B(&a0[0], &a1[0], &f0[0], &f1[0], k, &got[0], ldc, &bias[0], mode)
-			kernel12x32PortableNarrow(formatBF16, &a0[0], &a1[0], &f0[0], &f1[0], k, &want[0], ldc, &bias[0], mode)
-			if err := closeEnough(got, want); err != nil {
-				return fmt.Errorf("bf16 panels, k=%d mode=%d: %w", k, mode, err)
-			}
-			got, want = append(got[:0], start...), append(want[:0], start...)
-			kernel12x32AVX512I(&a0[0], &a1[0], &q0[0], &q1[0], k, &got[0], ldc, &bias[0], mode)
-			kernel12x32PortableInt8(&a0[0], &a1[0], &q0[0], &q1[0], k, &want[0], ldc, &bias[0], mode)
-			if err := closeEnough(got, want); err != nil {
-				return fmt.Errorf("int8 panels, k=%d mode=%d: %w", k, mode, err)
-			}
-		}
-	}
-	return nil
-}
-
-// closeEnough compares a kernel's output with the portable kernel's.
-func closeEnough(got, want []float32) error {
-	for i := range got {
-		if d := math.Abs(float64(got[i] - want[i])); !(d <= 1e-4*(1+math.Abs(float64(want[i])))) {
-			return fmt.Errorf("c[%d] = %g, portable %g", i, got[i], want[i])
 		}
 	}
 	return nil
