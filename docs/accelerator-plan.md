@@ -794,11 +794,114 @@ go test -run XXX -bench Generate ./model/t5
 
 ### Later: other accelerators
 
-The selection layer is designed so a second backend adds one case. Expect it
-to be harder elsewhere. On Linux, Go doesn't link libc without cgo, so
-calling `libcuda` or Vulkan needs what purego calls "fakecgo". That is a
-separate project, to start once Metal has shown what the backend interface
-needs.
+The selection layer is designed so a second backend adds one case. The
+first step toward CUDA, a bridge to the driver API, is done; no model
+kernels are ported yet, and nothing in `accel` or `model/` uses it.
+
+#### CUDA bridge (`internal/fakecgo`, `internal/dl`, `cuda`) — done
+
+On Linux, a Go program built without cgo cannot call C the way the Metal
+bridge does. The runtime starts threads with a raw `clone` and points the FS
+register at its own thread-local storage, while glibc expects every thread
+to come from `pthread_create` with FS pointing at glibc's thread control
+block. libcuda crashes on such a thread. Three packages fix that, with no
+cgo and no C compiler:
+
+1. **`internal/fakecgo`** does what purego calls "fakecgo". It sets
+   `runtime.iscgo` and defines, in amd64 assembly, the hooks package
+   `runtime/cgo` would otherwise supply: `_cgo_init`, `_cgo_thread_start`,
+   `_cgo_notify_runtime_init_done`, `_cgo_setenv`, `_cgo_unsetenv` and
+   `_cgo_pthread_key_created`, plus `set_crosscall2` in Go. With `iscgo` set,
+   `rt0_go` keeps the TLS that glibc's loader gave the main thread, and every
+   other thread comes from `pthread_create` through `_cgo_thread_start`, with
+   signals blocked until `minit` sets the mask, as in `runtime/cgo`. The hooks
+   reach glibc through `//go:cgo_import_dynamic`, so the internal linker
+   emits a dynamically linked executable. Two details cost a failed run each:
+   the runtime links `_cgo_setenv` and `_cgo_unsetenv` under its own
+   package's names (`runtime._cgo_setenv`), and every hook must be static
+   data, because `rt0_go` and `runtime.main` read them before any package's
+   `init` runs.
+2. **`internal/dl`** wraps `dlopen` and `dlsym`, and `Call` runs a C
+   function through `runtime.cgocall` (linknamed; purego uses it too). An
+   assembly trampoline takes up to 12 integer or pointer arguments, six of
+   them on the stack, which covers `cuLaunchKernel`'s eleven. `Call` is
+   `//go:uintptrescapes`, as `objc.Send` is. Go memory that C reaches
+   through other memory, such as the kernel argument pointer array, is held
+   with `runtime.Pinner`.
+3. **`cuda`** loads `libcuda.so.1` with `dlopen`, so a binary that imports
+   it still starts on a machine without the driver; there `Open` returns an
+   error wrapping `ErrUnavailable`. It has devices with their primary
+   context, device memory, `Write` and `Read` copies, PTX modules with the
+   JIT error log, kernels, and `Launch`. Kernels are PTX, which the driver
+   compiles at load time, so neither the CUDA toolkit nor NVRTC is needed. A
+   CUDA context is current per OS thread, so each `Device` call locks its
+   goroutine to a thread and makes the context current: one extra driver call
+   per operation.
+
+Run the tests with:
+
+```bash
+CGO_ENABLED=0 go test ./cuda/ ./internal/dl/               # includes the 2-minute soak
+CGO_ENABLED=0 go test -short ./cuda/ ./internal/dl/        # skips the soak and the interrupt test
+CGO_ENABLED=0 go test -run TestSoak ./cuda/ -args -cuda.soak=10m
+```
+
+Tests, passing with `CGO_ENABLED=0` on an NVIDIA L4 (compute capability
+8.9, driver 580, CUDA 13.0 per the driver) with Go 1.25.0, glibc 2.39:
+
+- `internal/dl` against libc: `strlen` and `getpid`, a 12-argument
+  `snprintf`, 64 goroutines each locked to its own thread calling
+  `strerror`, which reads glibc's TLS, `os.Setenv` reaching C's `getenv`,
+  and `dlopen`/`dlsym` error messages.
+- Vector add on 1, 255 and 1,048,579 elements (not a multiple of the
+  block), bit-identical to Go's float32 add, from one goroutine and from 16
+  at once.
+- Errors: bad PTX (`CUDA_ERROR_INVALID_PTX`, with ptxas's log), a missing
+  kernel, `Alloc(1<<62)`, a copy past a buffer's end, a device number that
+  does not exist.
+- Thread exit: 400 goroutines that lock their thread, use the device and
+  return without unlocking, so the runtime ends each thread and glibc runs
+  libcuda's destructors. Go threads went from 21 to 7 afterwards, and the
+  device still worked.
+- A soak (`TestSoak`, skipped with `-short`): six goroutines launching for
+  two minutes, every 50th iteration on a thread that then exits, with the
+  CPU profiler on, while SIGPROF and SIGWINCH are sent straight to libcuda's
+  own threads (`cuda-EvtHandlr`, `cuda00002000009`). There the runtime's
+  handler runs with no g. One run under `-cpuprofile`: 75,718 launches,
+  1,512 on exiting threads, 88,436 signals to libcuda's threads, no
+  failures. The profile has samples inside C, so SIGPROF landed while
+  threads were in libcuda and libc.
+- Ctrl-C: `TestInterrupt` starts a child that launches kernels and sends it
+  SIGINT, three times to the process and three times to one of libcuda's
+  threads. Each time the child dies from SIGINT within about 45 ms, with no
+  crash report. By hand, SIGINT to the whole process group of a running
+  `go test` soak, as a terminal sends it, ended the run in 86 ms and left no
+  process behind.
+- The test binary is dynamically linked against libc, libdl and libpthread,
+  with `CGO_ENABLED=0` and no `runtime/cgo` in it. `go vet ./...` is clean,
+  and darwin/arm64, linux/arm64 and windows/amd64 still build.
+
+Limits:
+
+- **linux/amd64 only.** The hooks and the call trampoline are amd64
+  assembly; linux/arm64 builds, but `cuda` reports unavailable there.
+- **Not with cgo on.** `runtime/cgo` would define the same hooks, so a build
+  with cgo enabled leaves `fakecgo` out, and `cuda.Open` returns
+  `ErrUnavailable`: the tests skip, including the `-race` run, which needs
+  cgo. Importing `runtime/cgo` in that case would make CUDA work there too,
+  at the cost of the no-cgo rule. On the GPU VM, `go env -w CGO_ENABLED=0`
+  makes the cgo-free build the default, so the tests cannot skip silently.
+- **A dynamically linked binary.** Any program that imports `cuda` needs
+  glibc at run time; programs that don't stay static.
+- **No callbacks from C into Go, and no float arguments or results** in
+  registers. Driver API calls need neither.
+- **`pthread_create` failure aborts the process**, without `runtime/cgo`'s
+  retries on `EAGAIN`.
+- **Not yet checked:** Go 1.25.5 and 1.26, which CI and the Metal work
+  used; older glibc, which the `libpthread.so.0` and `libdl.so.2` imports
+  are meant to support; and GPUs other than the L4.
+
+Vulkan on Linux would reuse `internal/fakecgo` and `internal/dl` unchanged.
 
 ## The spike
 
