@@ -116,6 +116,41 @@ func TestSoftmaxScaledMatchesFloat64(t *testing.T) {
 	}
 }
 
+// TestSoftmaxIndependentOfMaskedLength checks that a row of real scores gets
+// the same probabilities, bit for bit, alone and padded with any number of
+// masked (-Inf) entries, as causal attention pads it to its pass's length.
+// This is what lets a Session's reused prefix, run in a short pass, give the
+// same logits as the whole prompt in one pass.
+func TestSoftmaxIndependentOfMaskedLength(t *testing.T) {
+	r := rand.New(rand.NewPCG(27, 28))
+	for l := 1; l <= 40; l++ {
+		for range 20 {
+			x := make([]float32, l)
+			for i := range x {
+				x[i] = float32(r.NormFloat64() * 4)
+			}
+			alone := slices.Clone(x)
+			softmaxScaled(alone, 0.125)
+			for padded := l + 1; padded <= l+24; padded++ {
+				row := append(slices.Clone(x), make([]float32, padded-l)...)
+				for i := l; i < padded; i++ {
+					row[i] = float32(math.Inf(-1))
+				}
+				softmaxScaled(row, 0.125)
+				for i := range row {
+					want := float32(0)
+					if i < l {
+						want = alone[i]
+					}
+					if math.Float32bits(row[i]) != math.Float32bits(want) {
+						t.Fatalf("%d scores padded to %d: p[%d] = %g, want %g as the row alone gives", l, padded, i, row[i], want)
+					}
+				}
+			}
+		}
+	}
+}
+
 func BenchmarkSoftmaxRow(b *testing.B) {
 	r := rand.New(rand.NewPCG(25, 26))
 	x := make([]float32, 256)

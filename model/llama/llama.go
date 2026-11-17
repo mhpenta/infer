@@ -482,8 +482,9 @@ func (m *Model) GenerateWith(ids []int, maxNew int, s *sample.Sampler, fn func(t
 // prompt and every token generated after it but the last) and runs only the
 // rest. On the CPU, results are bit-identical to Model.GenerateWith on the
 // same prompt: every operation computes a row the same way whichever rows
-// run with it. On the GPU they match within float32 rounding (see
-// metal.go).
+// run with it, and attention's softmax gives a row the same bits however
+// long the pass it runs in. On the GPU they match within float32 rounding
+// (see metal.go).
 //
 // The cache stays allocated between calls: for Qwen3-1.7B, 112 KB per
 // position (28 layers of 8 key/value heads of 128, keys and values), until
