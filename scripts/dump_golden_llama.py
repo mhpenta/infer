@@ -8,6 +8,12 @@ so the Go implementation can be checked token for token and layer by layer.
 
 --chat-only writes just <out_prefix>_chat.json, for a model that shares
 another's tokenizer but has its own chat template; it loads no weights.
+--model-only writes just <out_prefix>_model.*, for a larger checkpoint that
+shares another's tokenizer and chat template (Qwen3-4B shares Qwen3-1.7B's),
+with hidden states for case 1 only, to keep the repository small.
+
+    .venv/bin/python scripts/dump_golden_llama.py --model-only testdata/models/qwen3-4b testdata/golden/qwen3_4b
+
 --tools writes just <out_prefix>_chat_tools.json: TOOL_CHAT_CASES, chat
 cases with tool definitions, assistant tool calls and tool messages.
 
@@ -292,13 +298,14 @@ def ids_of(encoded):
 
 def main():
     args = sys.argv[1:]
-    mode = args[0] if args[:1] in (["--chat-only"], ["--tools"]) else ""
+    mode = args[0] if args[:1] in (["--chat-only"], ["--tools"], ["--model-only"]) else ""
     if mode:
         args = args[1:]
     if len(args) != 2:
-        sys.exit(f"usage: python {sys.argv[0]} [--chat-only | --tools] <model_dir> <out_prefix>")
+        sys.exit(f"usage: python {sys.argv[0]} [--chat-only | --tools | --model-only] <model_dir> <out_prefix>")
     model_dir, out = args
     chat_only = mode == "--chat-only"
+    hidden_cases = {1} if mode == "--model-only" else HIDDEN_CASES
     tok = AutoTokenizer.from_pretrained(model_dir)
     if mode == "--tools":
         cases = []
@@ -323,24 +330,25 @@ def main():
             })
         return cases
 
-    chats = []
-    for c in CHAT_CASES:
+    chats, tokens = [], []
+    for c in CHAT_CASES if mode != "--model-only" else []:
         text = tok.apply_chat_template(c["messages"], tokenize=False, **c["options"])
         ids = tok(text, add_special_tokens=False)["input_ids"]
         if ids != ids_of(tok.apply_chat_template(c["messages"], tokenize=True, **c["options"])):
             sys.exit("chat template: encoding the rendered text differs from tokenize=True")
         chats.append({**c, "text": text, "ids": ids})
-    with open(f"{out}_chat.json", "w") as f:
-        json.dump(chats, f, ensure_ascii=False, indent=1)
-    if chat_only:
-        print(f"wrote {len(chats)} chat cases to {out}_chat.json")
-        return
+    if mode != "--model-only":
+        with open(f"{out}_chat.json", "w") as f:
+            json.dump(chats, f, ensure_ascii=False, indent=1)
+        if chat_only:
+            print(f"wrote {len(chats)} chat cases to {out}_chat.json")
+            return
 
-    tokens = token_cases(TOKENIZER_CASES)
-    with open(f"{out}_tokens.json", "w") as f:
-        json.dump(tokens, f, ensure_ascii=False, indent=1)
-    with open(f"{out}_tokens_random.json", "w") as f:
-        json.dump(token_cases(random_texts(RANDOM_CASES)), f, ensure_ascii=False, indent=1)
+        tokens = token_cases(TOKENIZER_CASES)
+        with open(f"{out}_tokens.json", "w") as f:
+            json.dump(tokens, f, ensure_ascii=False, indent=1)
+        with open(f"{out}_tokens_random.json", "w") as f:
+            json.dump(token_cases(random_texts(RANDOM_CASES)), f, ensure_ascii=False, indent=1)
 
     model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="eager").eval()
     eos = model.generation_config.eos_token_id
@@ -360,7 +368,7 @@ def main():
                 do_sample=False, temperature=None, top_p=None, top_k=None, eos_token_id=eos, pad_token_id=eos[0],
             )[0]
             new = seq[n:]
-            full = model(input_ids=seq[:-1].unsqueeze(0), output_hidden_states=i in HIDDEN_CASES)
+            full = model(input_ids=seq[:-1].unsqueeze(0), output_hidden_states=i in hidden_cases)
         logits = full.logits[0]
         if not torch.equal(logits[n - 1:].argmax(-1), new):
             sys.exit(f"case {i}: teacher-forced argmax does not reproduce greedy generation")
@@ -369,7 +377,7 @@ def main():
         tensors[f"case{i}.topk.indices"] = top.indices.to(torch.int32).clone()
         if i in FULL_CASES:
             tensors[f"case{i}.logits"] = logits[n - 1:n - 1 + FULL_LOGIT_STEPS].clone()
-        if i in HIDDEN_CASES:
+        if i in hidden_cases:
             if len(full.hidden_states) != model.config.num_hidden_layers + 1:
                 sys.exit(f"case {i}: {len(full.hidden_states)} hidden states, want layers + 1")
             for j, h in enumerate(full.hidden_states):

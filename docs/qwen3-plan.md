@@ -152,6 +152,63 @@ Tools come later (step 5).
    - **Not supported:** MiniCPM5's templates have their own XML tool format,
      which is not implemented; they reject tools.
 
+## Qwen3-4B
+
+The next size up, and the largest model tested so far. Pinned:
+`Qwen/Qwen3-4B` at `1cfa9a7208912126459214e8b04321603b3df60c`,
+`scripts/fetch_models.sh qwen3-4b` (8 GB, not in "all").
+
+| | Qwen3-1.7B | Qwen3-4B |
+|---|---|---|
+| hidden, layers | 2048, 28 | 2560, 36 |
+| heads (query / key-value) | 16 / 8 | 32 / 8 |
+| feed-forward | 6144 | 9728 |
+| weights | 4.1 GB (3.4 GB packed) | 8.0 GB (7.9 GB packed) |
+
+Its `tokenizer.json`, `tokenizer_config.json` (with the chat template),
+`vocab.json`, `merges.txt` and `generation_config.json` are byte-identical to
+Qwen3-1.7B's, so its goldens are the model's alone:
+`dump_golden_llama.py --model-only` writes `testdata/golden/qwen3_4b_model.*`
+(15.6 MB), with hidden states for case 1 only. PyTorch in float32 peaked at
+21 GB. It loads with no code changes.
+
+**Checked against PyTorch** (`TestMatchesPython/qwen3-4b`, skipped with
+`-short`), on the CPU and Metal:
+
+| Check | CPU / Metal |
+|---|---|
+| every layer's input and the final output, case 1 | within 5.4e-6 of the tensor's range (Metal) |
+| top-64 logits at every position, including position 0 | within 6.4e-6 |
+| greedy tokens with the cache, all 4 cases including 2,579 → 24 | identical |
+| sessions reusing a prefix | the same tokens; bit-identical to an empty cache on the CPU |
+
+PyTorch's answers: " Paris. The capital of Germany is Berlin", "391", and
+one-sentence summaries of both summary prompts. The 4:1 query-to-key-value
+grouping (1.7B's is 2:1) needed nothing new.
+
+**Speed** (M2 Max, 32 GB, `BenchmarkDecodeWeights` and `BenchmarkPrefill`,
+the 66-token summary prompt; the machine was busy, with 13–17 GB of swap
+in use):
+
+| | Qwen3-1.7B | Qwen3-4B |
+|---|---|---|
+| decode, Metal bf16 | 13–18 ms/token | 29–37 ms/token (27–34 tokens/s) |
+| decode, Metal int8 | 9.3 ms/token | 17.5 ms/token (57 tokens/s) |
+| decode, CPU bf16 | 40–42 ms/token | 126–495 ms/token (see below) |
+| decode, CPU int8 | 27.5 ms/token | 70.5 ms/token (14 tokens/s) |
+| prefill, Metal, 66 / 2,579 tokens | 122 ms / 2.5 s | 260 ms / 6.8 s (381 tokens/s) |
+| prefill, CPU, 66 / 2,579 tokens | 0.87 s / 24 s | 1.5 s / 72 s |
+
+Metal streams the 4B's weights at about 215 GB/s (1.7B: about 195), and
+int8 on the CPU scales with the weights' size (2.6× the 1.7B's time for
+2.3× the bytes). bf16 on the CPU does not: three runs gave 178, 495 and
+126 ms/token. During the slowest, `vm_stat` showed about 64 MB free and the
+compressor moving 8–16 GB every 5 seconds. Its 7.9 GB of packed weights are
+anonymous memory, which macOS compresses and swaps when the machine is
+short of memory. Metal's buffers and int8's 4 GB stayed resident. On a
+32 GB Mac that runs other large programs, run Qwen3-4B on the GPU, or with
+int8 weights on the CPU.
+
 ## Open questions
 
 - **Repo size:** Qwen3's goldens will add roughly 14 MB (hidden states for

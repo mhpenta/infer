@@ -91,9 +91,19 @@ var (
 	// of their range from PyTorch's (after <|im_start|>; 6.1e-6 after the
 	// raw-text case's first token). Every later position stays within
 	// 1.2e-5.
-	qwen3 = goldenModel{"INFER_QWEN3_DIR", "qwen3-1.7b", "qwen3_1.7b", 3e-5, checkQwen3Config, ""}
+	qwen3 = goldenModel{"INFER_QWEN3_DIR", "qwen3-1.7b", "qwen3_1.7b", 3e-5, qwen3Config(16, 28), ""}
 
+	// Qwen3-4B (8 GB, not in CI: scripts/fetch_models.sh qwen3-4b) shares
+	// Qwen3-1.7B's tokenizer and chat template, so its goldens are the
+	// model's alone, with hidden states for case 1 only.
+	qwen3For4B = goldenModel{"INFER_QWEN3_4B_DIR", "qwen3-4b", "qwen3_4b", 3e-5, qwen3Config(32, 36), ""}
+
+	// goldenModels run in every test that compares with PyTorch.
 	goldenModels = []goldenModel{miniCPM, qwen3}
+
+	// largeModels run only in TestMatchesPython and the benchmarks, and
+	// are skipped with -short.
+	largeModels = []goldenModel{qwen3For4B}
 )
 
 // loaded is a model with its golden cases and reference tensors.
@@ -167,10 +177,14 @@ func (c modelCase) sequence() []int {
 // device at a time: its configuration, hidden states, top-64 logits and
 // generation.
 func TestMatchesPython(t *testing.T) {
-	for _, g := range goldenModels {
+	for i, g := range slices.Concat(goldenModels, largeModels) {
+		large := i >= len(goldenModels)
 		for _, device := range testDevices(t) {
 			g := g.on(device)
 			t.Run(g.key(), func(t *testing.T) {
+				if large && testing.Short() {
+					t.Skip("large model skipped with -short")
+				}
 				defer g.release()
 				t.Run("Config", func(t *testing.T) {
 					m, _, _ := g.load(t)
@@ -204,34 +218,45 @@ func checkMiniCPMConfig(t *testing.T, m *Model) {
 	}
 }
 
-func checkQwen3Config(t *testing.T, m *Model) {
+// qwen3Config checks a Qwen3 checkpoint with the given query heads and
+// layers (both sizes have 8 key-value heads of 128).
+func qwen3Config(heads, layers int) func(t *testing.T, m *Model) {
+	return func(t *testing.T, m *Model) { checkQwen3Config(t, m, heads, layers) }
+}
+
+func checkQwen3Config(t *testing.T, m *Model, heads, layers int) {
 	c := m.Config
-	if c.HeadDim != 128 || c.NumKeyValueHeads != 8 || c.NumAttentionHeads != 16 || !c.TieWordEmbeddings || !c.qkNorm() {
+	if c.HeadDim != 128 || c.NumKeyValueHeads != 8 || c.NumAttentionHeads != heads || c.NumHiddenLayers != layers ||
+		!c.TieWordEmbeddings || !c.qkNorm() {
 		t.Errorf("config %+v", c)
 	}
+	last := layers - 1
 	// config.json lists only <|im_end|>; generation_config.json adds <|endoftext|>.
 	if !slices.Equal(c.EOS, []int{151645, 151643}) {
 		t.Errorf("end tokens %v, want generation_config.json's [151645 151643]", c.EOS)
 	}
 	if g := m.gpu; g != nil {
-		if g.layers[0].qNorm.Buf == nil || g.layers[27].kNorm.Buf == nil || g.lmHead.W != g.embed {
+		if g.layers[0].qNorm.Buf == nil || g.layers[last].kNorm.Buf == nil || g.lmHead.W != g.embed {
 			t.Error("the GPU's weights lack q/k norms or an output layer tied to the embeddings")
 		}
 		return
 	}
-	if !m.lmHead.BF16() || m.embed.bf16 == nil || m.layers[0].qNorm == nil || m.layers[27].kNorm == nil {
+	if !m.lmHead.BF16() || m.embed.bf16 == nil || m.layers[0].qNorm == nil || m.layers[last].kNorm == nil {
 		t.Error("bf16 weights or q/k norms missing")
 	}
 }
 
 // checkHiddenStates compares every layer's input and the final
 // output with transformers' hidden states, and the full logits of the
-// positions where generation starts.
+// positions where generation starts, for the cases that have them.
 func checkHiddenStates(t *testing.T, g goldenModel) {
 	m, cases, want := g.load(t)
 	for i := range 2 {
 		c := cases[i]
 		t.Run(fmt.Sprintf("case%d", i), func(t *testing.T) {
+			if !want.Has(fmt.Sprintf("case%d.hidden.0", i)) {
+				t.Skip("no hidden states in the goldens")
+			}
 			states, err := m.HiddenStates(c.sequence())
 			if err != nil {
 				t.Fatal(err)
