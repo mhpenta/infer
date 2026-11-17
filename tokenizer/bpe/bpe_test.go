@@ -23,7 +23,7 @@ type tokenCase struct {
 
 // goldenModel is a tokenizer with PyTorch goldens: its directory under
 // testdata/models (or envVar), the goldens' file prefix and the added tokens
-// it must know.
+// it must know. Models without chat goldens have no special tokens listed.
 type goldenModel struct {
 	envVar, dir, prefix string
 	special             []string
@@ -32,6 +32,9 @@ type goldenModel struct {
 var goldenModels = []goldenModel{
 	{"INFER_MINICPM5_DIR", "minicpm5-1b", "minicpm5_1b", []string{"<s>", "</s>", "<|im_start|>", "<|im_end|>", "<think>"}},
 	{"INFER_QWEN3_DIR", "qwen3-1.7b", "qwen3_1.7b", []string{"<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "<tool_call>"}},
+	// OpenJev's Qwen3.5 checkpoint: Qwen3.5's tokenizer, whose split keeps
+	// combining marks in words (pretokenize_regex), and no chat goldens.
+	{"INFER_OPENJEV_DIR", "openjev-0.8b", "openjev_0.8b", nil},
 }
 
 func (g goldenModel) load(t testing.TB) *Tokenizer {
@@ -71,7 +74,7 @@ func checkCases(t *testing.T, tok *Tokenizer, file string) {
 // TestMatchesPython checks each model's edge cases and 400 seeded random
 // strings mixing scripts, Unicode spaces and digits, combining marks,
 // contractions and fragments of added tokens (see
-// scripts/dump_golden_llama.py).
+// scripts/dump_golden_llama.py and dump_golden_qwen35.py).
 func TestMatchesPython(t *testing.T) {
 	for _, g := range goldenModels {
 		t.Run(g.dir, func(t *testing.T) {
@@ -86,6 +89,9 @@ func TestMatchesPython(t *testing.T) {
 // rendered; the template itself is the chat package's to reproduce.
 func TestChatTextMatchesPython(t *testing.T) {
 	for _, g := range goldenModels {
+		if g.special == nil {
+			continue
+		}
 		t.Run(g.dir, func(t *testing.T) {
 			tok := g.load(t)
 			var cases []struct {
@@ -130,7 +136,7 @@ func TestSplitWords(t *testing.T) {
 		{"​", []string{"​"}}, // zero-width space is not White_Space
 	}
 	for _, tt := range tests {
-		if got := splitWords(true)(nil, tt.in); !slices.Equal(got, tt.want) {
+		if got := splitWords(wordStyle{numberRuns: true})(nil, tt.in); !slices.Equal(got, tt.want) {
 			t.Errorf("splitWords(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
@@ -150,7 +156,29 @@ func TestSplitWordsSingleNumbers(t *testing.T) {
 		{"I'm 3", []string{"I", "'m", " ", "3"}},
 	}
 	for _, tt := range tests {
-		if got := splitWords(false)(nil, tt.in); !slices.Equal(got, tt.want) {
+		if got := splitWords(wordStyle{})(nil, tt.in); !slices.Equal(got, tt.want) {
+			t.Errorf("splitWords(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestSplitWordsMarks checks Qwen3.5's variant, where combining marks are
+// word characters rather than punctuation.
+func TestSplitWordsMarks(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"été", []string{"été"}},
+		{"q́x", []string{"q́x"}},
+		{"́x", []string{"́x"}},         // a leading mark starts the word
+		{"a ́b", []string{"a", " ́b"}}, // a space, then the word
+		{"!́", []string{"!́"}},         // a mark after punctuation joins it as a word
+		{"हिन्दी 12", []string{"हिन्दी", " ", "1", "2"}}, // vowel signs and the virama are marks
+		{"x.́́", []string{"x", ".́́"}},
+	}
+	for _, tt := range tests {
+		if got := splitWords(wordStyle{marks: true})(nil, tt.in); !slices.Equal(got, tt.want) {
 			t.Errorf("splitWords(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}

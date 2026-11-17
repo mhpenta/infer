@@ -44,11 +44,19 @@ const cacheSize = 10000
 // be a huge allocation.
 const maxTokenID = 1 << 24
 
-// Config controls decoding.
+// Config controls decoding, and the split pattern when tokenizer.json's is
+// not the one transformers uses.
 type Config struct {
 	// CleanUpSpaces removes spaces before punctuation and in English
 	// contractions when decoding (clean_up_tokenization_spaces).
 	CleanUpSpaces bool
+
+	// SplitPattern, if set, replaces the regex of tokenizer.json's Split
+	// pre-tokenizer. transformers' Qwen3.5 tokenizer builds its own
+	// pre-tokenizer, with a pattern that keeps combining marks in words, and
+	// ignores the Qwen3 pattern its checkpoints' tokenizer.json carries; their
+	// tokenizer_config.json records the one it uses as pretokenize_regex.
+	SplitPattern string
 }
 
 // Tokenizer turns text into ids and back. It is safe for concurrent use.
@@ -70,15 +78,17 @@ type Tokenizer struct {
 	cache map[string][]int
 }
 
-// LoadDir loads tokenizer.json and reads clean_up_tokenization_spaces from
-// tokenizer_config.json, if present.
+// LoadDir loads tokenizer.json and reads clean_up_tokenization_spaces and
+// pretokenize_regex (Config.SplitPattern) from tokenizer_config.json, if
+// present.
 func LoadDir(dir string) (*Tokenizer, error) {
 	config := Config{CleanUpSpaces: true} // transformers' default
 	raw, err := os.ReadFile(filepath.Join(dir, "tokenizer_config.json"))
 	switch {
 	case err == nil:
 		var tc struct {
-			CleanUp *bool `json:"clean_up_tokenization_spaces"`
+			CleanUp      *bool  `json:"clean_up_tokenization_spaces"`
+			SplitPattern string `json:"pretokenize_regex"`
 		}
 		if err := json.Unmarshal(raw, &tc); err != nil {
 			return nil, fmt.Errorf("bpe: parse tokenizer_config.json: %w", err)
@@ -86,6 +96,7 @@ func LoadDir(dir string) (*Tokenizer, error) {
 		if tc.CleanUp != nil {
 			config.CleanUpSpaces = *tc.CleanUp
 		}
+		config.SplitPattern = tc.SplitPattern
 	case !errors.Is(err, os.ErrNotExist):
 		return nil, fmt.Errorf("bpe: %w", err)
 	}
@@ -256,6 +267,7 @@ func parseMerge(raw json.RawMessage) (string, string, error) {
 
 // parsePreTokenizer accepts Split patterns this package implements, then a
 // ByteLevel step that only maps bytes (no prefix space, no regex of its own).
+// Config.SplitPattern replaces the pattern of the one Split step.
 func (t *Tokenizer) parsePreTokenizer(raw json.RawMessage) error {
 	var p struct {
 		Type          string            `json:"type"`
@@ -270,6 +282,9 @@ func (t *Tokenizer) parsePreTokenizer(raw json.RawMessage) error {
 	steps := []json.RawMessage{raw}
 	if p.Type == "Sequence" {
 		steps = p.PreTokenizers
+	}
+	if t.config.SplitPattern != "" && len(steps) != 2 {
+		return fmt.Errorf("bpe: pretokenize_regex replaces one Split step, but the pre_tokenizer has %d steps", len(steps))
 	}
 	for i, step := range steps {
 		var s struct {
@@ -291,9 +306,13 @@ func (t *Tokenizer) parsePreTokenizer(raw json.RawMessage) error {
 			if s.Pattern.Regex == nil || s.Behavior != "Isolated" || s.Invert {
 				return fmt.Errorf("bpe: only Isolated Split on a regex is supported, got %s", step)
 			}
-			fn, ok := splitPatterns[*s.Pattern.Regex]
+			pattern := *s.Pattern.Regex
+			if t.config.SplitPattern != "" {
+				pattern = t.config.SplitPattern
+			}
+			fn, ok := splitPatterns[pattern]
 			if !ok {
-				return fmt.Errorf("bpe: Split pattern %q is not supported", *s.Pattern.Regex)
+				return fmt.Errorf("bpe: Split pattern %q is not supported", pattern)
 			}
 			t.splits = append(t.splits, fn)
 		case "ByteLevel":

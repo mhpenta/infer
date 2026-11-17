@@ -10,19 +10,24 @@
 #   scripts/fetch_models.sh minicpm5-2b # MiniCPM5-2B (~5 GB, bf16; not in "all")
 #   scripts/fetch_models.sh qwen3      # Qwen3-1.7B (~4.1 GB, bf16; not in "all")
 #   scripts/fetch_models.sh qwen3-4b   # Qwen3-4B (~8 GB, bf16; not in "all")
+#   scripts/fetch_models.sh openjev-0.8b # OpenJev's Qwen3.5-0.8B NLI checkpoint (~1.7 GB, bf16; not in "all")
+#   scripts/fetch_models.sh openjev-4b # OpenJev's Qwen3.5-4B NLI checkpoint, v5 (~9.1 GB, bf16; not in "all")
 set -eu
 cd "$(dirname "$0")/.."
 
-fetch() { # name repo revision "sha256  file" lines...
-	name=$1 repo=$2 rev=$3
+fetch() { # name repo[:subfolder] revision "sha256  file" lines...
+	name=$1 repo=${2%%:*} rev=$3
+	sub=${2#"$repo"}
+	sub=${sub#:}
+	sub=${sub:+$sub/}
 	shift 3
 	dir=testdata/models/$name
 	mkdir -p "$dir"
 	for line in "$@"; do
 		file=${line##* }
 		if [ ! -s "$dir/$file" ]; then
-			echo "fetching $repo $file"
-			curl -fsSL --retry 5 -o "$dir/$file" "https://huggingface.co/$repo/resolve/$rev/$file"
+			echo "fetching $repo $sub$file"
+			curl -fsSL --retry 5 -o "$dir/$file" "https://huggingface.co/$repo/resolve/$rev/$sub$file"
 		fi
 	done
 	(cd "$dir" && printf '%s\n' "$@" | shasum -a 256 -c -)
@@ -105,4 +110,20 @@ if [ "$want" = qwen3-4b ]; then
 		'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910  vocab.json' \
 		'8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5  merges.txt' \
 		'832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e  LICENSE'
+fi
+
+if [ "$want" = openjev-0.8b ]; then
+	fetch openjev-0.8b AlexWortega/openjev:qwen3.5-0.8b-nli-v2s-long a20448012c213128955ca0c693e7c943865cab77 \
+		'3b914561e53dad38981a498af0b0bf430300be9d3e5fa3cd7b10c2049c073e52  config.json' \
+		'cf6d62a341c0c804f9a926eec71aefc9859adb28978736e757b49bce35d9b8f8  model.safetensors' \
+		'd73c2c5f7aa0ed522c8d96ef3524739eb61e3c78e74839a2ce4a1c56ea340a20  tokenizer.json' \
+		'289d88d849f89fcf0f9c145773122f6718095cd4aee05435afbd0293569c7085  tokenizer_config.json'
+fi
+
+if [ "$want" = openjev-4b ]; then
+	fetch openjev-4b AlexWortega/openjev:qwen3.5-4b-nli-v5 a20448012c213128955ca0c693e7c943865cab77 \
+		'2fb08b5484dc21cb8e6db9b1fef8437b365f7fa0ef877055cf2bc0f8063a65a2  config.json' \
+		'2b5f6e0691a5ed0c5d0f5f3e49bb26abe2d8efd7c14fda4431cd803c12b78f68  model.safetensors' \
+		'f399b3cd12fa270d51457bb749fb30863521e8359b8a27059c71b6c2f7d6dd6c  tokenizer.json' \
+		'e6f32d049fd16bd0e49604e9173193213fe260984de4629a85d551d85e566020  tokenizer_config.json'
 fi

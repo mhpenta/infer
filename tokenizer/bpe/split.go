@@ -17,8 +17,9 @@ type splitFunc func(dst []string, s string) []string
 // has a hand-written scanner, keyed by its exact source.
 var splitPatterns = map[string]splitFunc{
 	`\p{N}{1,3}`: splitDigits(3),
-	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`: splitWords(true),  // MiniCPM5
-	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`:  splitWords(false), // Qwen2, Qwen3
+	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`:            splitWords(wordStyle{numberRuns: true}), // MiniCPM5
+	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`:             splitWords(wordStyle{}),                 // Qwen2, Qwen3
+	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`: splitWords(wordStyle{marks: true}),      // Qwen3.5
 }
 
 // splitDigits isolates runs of up to limit number characters (\p{N}), taken
@@ -53,9 +54,19 @@ func splitDigits(limit int) splitFunc {
 	}
 }
 
-// splitWords returns the GPT-4-style word split: cl100k's pattern with
-// \p{N}+ when numberRuns is set, or with \p{N}, one number character per
-// piece, as Qwen's tokenizers write it:
+// wordStyle selects a variant of splitWords's pattern.
+type wordStyle struct {
+	// numberRuns makes a number \p{N}+, a run, instead of \p{N}, one number
+	// character per piece as Qwen's tokenizers write it.
+	numberRuns bool
+	// marks makes a word [\p{L}\p{M}]+ and punctuation [^\s\p{L}\p{M}\p{N}],
+	// keeping combining marks in their words, as Qwen3.5's tokenizer writes
+	// them.
+	marks bool
+}
+
+// splitWords returns the GPT-4-style word split, cl100k's pattern in the
+// variant style picks:
 //
 //	(?i:'s|'t|'re|'ve|'m|'ll|'d)   contractions
 //	[^\r\n\p{L}\p{N}]?\p{L}+       a word, with one leading non-letter
@@ -69,10 +80,10 @@ func splitDigits(limit int) splitFunc {
 //
 // Every character matches some alternative, so the pieces are exactly the
 // successive matches.
-func splitWords(numberRuns bool) splitFunc {
+func splitWords(style wordStyle) splitFunc {
 	return func(dst []string, s string) []string {
 		for i := 0; i < len(s); {
-			end := wordEnd(s, i, numberRuns)
+			end := wordEnd(s, i, style)
 			dst = append(dst, s[i:end])
 			i = end
 		}
@@ -82,7 +93,7 @@ func splitWords(numberRuns bool) splitFunc {
 
 // wordEnd returns the end of the match at s[i:], trying the alternatives in
 // order as a backtracking regex engine does.
-func wordEnd(s string, i int, numberRuns bool) int {
+func wordEnd(s string, i int, style wordStyle) int {
 	r0, size0 := utf8.DecodeRuneInString(s[i:])
 
 	if r0 == '\'' {
@@ -91,16 +102,18 @@ func wordEnd(s string, i int, numberRuns bool) int {
 		}
 	}
 
-	if isLetter(r0) {
-		return letters(s, i)
+	// A word's optional leading character, [^\r\n\p{L}\p{N}], can be a mark;
+	// when marks are word characters, the run then simply starts there.
+	if style.isWord(r0) {
+		return style.wordRun(s, i)
 	}
 	if r0 != '\r' && r0 != '\n' && !isNumber(r0) && i+size0 < len(s) {
-		if r1, _ := utf8.DecodeRuneInString(s[i+size0:]); isLetter(r1) {
-			return letters(s, i+size0)
+		if r1, _ := utf8.DecodeRuneInString(s[i+size0:]); style.isWord(r1) {
+			return style.wordRun(s, i+size0)
 		}
 	}
 
-	if isNumber(r0) && !numberRuns {
+	if isNumber(r0) && !style.numberRuns {
 		return i + size0
 	}
 	if isNumber(r0) {
@@ -115,13 +128,13 @@ func wordEnd(s string, i int, numberRuns bool) int {
 		return end
 	}
 
-	if p := i; isPunct(r0) || (r0 == ' ' && p+1 < len(s) && isPunct(firstRune(s[p+1:]))) {
+	if p := i; style.isPunct(r0) || (r0 == ' ' && p+1 < len(s) && style.isPunct(firstRune(s[p+1:]))) {
 		if r0 == ' ' {
 			p++
 		}
 		for p < len(s) {
 			r, size := utf8.DecodeRuneInString(s[p:])
-			if !isPunct(r) {
+			if !style.isPunct(r) {
 				break
 			}
 			p += size
@@ -184,11 +197,11 @@ func hasFoldPrefix(s, word string) int {
 	return n
 }
 
-// letters returns the end of the run of letters starting at s[i:].
-func letters(s string, i int) int {
+// wordRun returns the end of the run of word characters starting at s[i:].
+func (w wordStyle) wordRun(s string, i int) int {
 	for i < len(s) {
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if !isLetter(r) {
+		if !w.isWord(r) {
 			break
 		}
 		i += size
@@ -204,8 +217,11 @@ func firstRune(s string) rune {
 func isLetter(r rune) bool { return unicode.IsLetter(r) }
 func isNumber(r rune) bool { return unicode.IsNumber(r) }
 
-// isPunct is [^\s\p{L}\p{N}].
-func isPunct(r rune) bool { return !unicode.IsSpace(r) && !isLetter(r) && !isNumber(r) }
+// isWord is \p{L}, or [\p{L}\p{M}] with marks.
+func (w wordStyle) isWord(r rune) bool { return isLetter(r) || w.marks && unicode.IsMark(r) }
+
+// isPunct is [^\s\p{L}\p{N}], or [^\s\p{L}\p{M}\p{N}] with marks.
+func (w wordStyle) isPunct(r rune) bool { return !unicode.IsSpace(r) && !w.isWord(r) && !isNumber(r) }
 
 // byteChars is GPT-2's bytes_to_unicode: printable Latin-1 bytes stand for
 // themselves, and the rest map to code points from U+0100 up, so every byte
