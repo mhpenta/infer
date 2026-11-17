@@ -70,8 +70,9 @@ func erff(x float32) float32 {
 }
 
 // Portable slice loops behind softmax and GELU. On amd64 with AVX2 the
-// dispatchers in simd_amd64.go run 8 lanes at a time and use these only for
-// the leftover tail, so both paths compute the same formulas.
+// dispatchers in simd_amd64.go run 8 lanes at a time instead; scaleGo and
+// geluGo still handle their leftover tail, but the softmax steps do not, so
+// that a row's softmax does not depend on its length (see simd_amd64.go).
 
 // maxGo returns the largest element of a non-empty x.
 func maxGo(x []float32) float32 {
