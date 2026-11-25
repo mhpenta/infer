@@ -20,7 +20,11 @@ var splitPatterns = map[string]splitFunc{
 	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`:            splitWords(wordStyle{numberRuns: true}), // MiniCPM5
 	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`:             splitWords(wordStyle{}),                 // Qwen2, Qwen3
 	`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`: splitWords(wordStyle{marks: true}),      // Qwen3.5
+	o200kPattern: splitO200k, // GPT-4o (o200k_base), Inkling 2
 }
+
+// o200kPattern is o200k_base's split pattern, as tokenizer.json writes it.
+const o200kPattern = `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 
 // splitDigits isolates runs of up to limit number characters (\p{N}), taken
 // from the left, so "12345" becomes "123", "45".
@@ -145,7 +149,14 @@ func wordEnd(s string, i int, style wordStyle) int {
 		return p
 	}
 
-	// r0 is whitespace. Find the run and its last newline.
+	// r0 is whitespace.
+	return whitespaceEnd(s, i)
+}
+
+// whitespaceEnd returns the end of the whitespace alternatives at s[i:],
+// \s*[\r\n]+, \s+(?!\S) and \s+, where s[i] is whitespace.
+func whitespaceEnd(s string, i int) int {
+	// Find the run and its last newline.
 	end, lastNewline, lastSize := i, -1, 0
 	for end < len(s) {
 		r, size := utf8.DecodeRuneInString(s[end:])
@@ -241,3 +252,131 @@ var byteChars, charBytes = func() ([256]rune, map[rune]byte) {
 	}
 	return chars, bytes
 }()
+
+// splitO200k is o200k_base's split:
+//
+//	P?U*L+C?          a word ending in lowercase: P is one optional
+//	                  [^\r\n\p{L}\p{N}], U is [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}],
+//	                  L is [\p{Ll}\p{Lm}\p{Lo}\p{M}], and C an optional
+//	                  contraction ('s, 't, 're, 've, 'm, 'll, 'd, any case)
+//	P?U+L*C?          a word in capitals
+//	\p{N}{1,3}        up to three number characters
+//	 ?[^\s\p{L}\p{N}]+[\r\n/]*
+//	                  punctuation, with a leading space and trailing
+//	                  newlines or slashes
+//	\s*[\r\n]+ | \s+(?!\S) | \s+
+//	                  whitespace, as in splitWords
+//
+// Every character matches some alternative, so the pieces are exactly the
+// successive matches.
+func splitO200k(dst []string, s string) []string {
+	for i := 0; i < len(s); {
+		end := o200kEnd(s, i)
+		dst = append(dst, s[i:end])
+		i = end
+	}
+	return dst
+}
+
+func o200kEnd(s string, i int) int {
+	if end, ok := o200kWord(s, i, true); ok {
+		return end
+	}
+	if end, ok := o200kWord(s, i, false); ok {
+		return end
+	}
+	r0, size0 := utf8.DecodeRuneInString(s[i:])
+	if isNumber(r0) {
+		end := i
+		for n := 0; n < 3 && end < len(s); n++ {
+			r, size := utf8.DecodeRuneInString(s[end:])
+			if !isNumber(r) {
+				break
+			}
+			end += size
+		}
+		return end
+	}
+	punct := func(r rune) bool { return !unicode.IsSpace(r) && !isLetter(r) && !isNumber(r) }
+	if p := i; punct(r0) || (r0 == ' ' && p+size0 < len(s) && punct(firstRune(s[p+size0:]))) {
+		if r0 == ' ' {
+			p++
+		}
+		for p < len(s) {
+			r, size := utf8.DecodeRuneInString(s[p:])
+			if !punct(r) {
+				break
+			}
+			p += size
+		}
+		for p < len(s) && (s[p] == '\r' || s[p] == '\n' || s[p] == '/') {
+			p++
+		}
+		return p
+	}
+	return whitespaceEnd(s, i)
+}
+
+// o200kWord matches P?U*L+C? (lower) or P?U+L*C? at s[i:], trying the
+// choices in the order a backtracking engine does: the optional P taken
+// first, then the longest U run, giving back characters one at a time.
+func o200kWord(s string, i int, lower bool) (int, bool) {
+	r0, size0 := utf8.DecodeRuneInString(s[i:])
+	starts := []int{i}
+	if r0 != '\r' && r0 != '\n' && !isLetter(r0) && !isNumber(r0) {
+		starts = []int{i + size0, i}
+	}
+	for _, start := range starts {
+		ends := []int{start} // ends[k] is the end of a U run of k characters
+		for j := start; j < len(s); {
+			r, size := utf8.DecodeRuneInString(s[j:])
+			if !o200kUpper(r) {
+				break
+			}
+			j += size
+			ends = append(ends, j)
+		}
+		if !lower {
+			if len(ends) < 2 {
+				continue
+			}
+			return withContraction(s, runEnd(s, ends[len(ends)-1], o200kLower)), true
+		}
+		for k := len(ends) - 1; k >= 0; k-- {
+			if e := runEnd(s, ends[k], o200kLower); e > ends[k] {
+				return withContraction(s, e), true
+			}
+		}
+	}
+	return 0, false
+}
+
+func o200kUpper(r rune) bool {
+	return unicode.In(r, unicode.Lu, unicode.Lt, unicode.Lm, unicode.Lo, unicode.M)
+}
+
+func o200kLower(r rune) bool {
+	return unicode.In(r, unicode.Ll, unicode.Lm, unicode.Lo, unicode.M)
+}
+
+// runEnd returns the end of the run of characters in class from s[i:].
+func runEnd(s string, i int, class func(rune) bool) int {
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !class(r) {
+			break
+		}
+		i += size
+	}
+	return i
+}
+
+// withContraction extends a word ending at end by a contraction after it.
+func withContraction(s string, end int) int {
+	if end < len(s) && s[end] == '\'' {
+		if n := contraction(s[end+1:]); n > 0 {
+			return end + 1 + n
+		}
+	}
+	return end
+}

@@ -53,14 +53,24 @@ func Add(dst, src []float32) {
 // then applies the per-feature weight and bias. Statistics are accumulated in
 // float64.
 func LayerNorm(x, weight, bias *tensor.Tensor, eps float64) {
-	checkLayerNorm("LayerNorm", x, weight, bias)
-	for i := range x.Rows() {
-		row := x.Row(i)
+	LayerNormInto(x, x, weight, bias, eps)
+}
+
+// LayerNormInto normalizes each row of src into dst (which may alias src) to
+// zero mean and unit variance, then applies the per-feature weight and bias.
+// Statistics are accumulated in float64.
+func LayerNormInto(dst, src, weight, bias *tensor.Tensor, eps float64) {
+	checkLayerNorm("LayerNormInto", src, weight, bias)
+	if dst.Rows() != src.Rows() || dst.Cols() != src.Cols() {
+		panic(fmt.Sprintf("ops.LayerNormInto: dst is %v, src %v", dst.Shape, src.Shape))
+	}
+	for i := range src.Rows() {
+		srow, drow := src.Row(i), dst.Row(i)
 		var sum float64
-		for _, v := range row {
+		for _, v := range srow {
 			sum += float64(v)
 		}
-		normalizeRow(row, sum, weight.Data, bias.Data, eps)
+		normalizeRowInto(drow, srow, sum, weight.Data, bias.Data, eps)
 	}
 }
 
@@ -78,7 +88,7 @@ func AddLayerNorm(x, residual, weight, bias *tensor.Tensor, eps float64) {
 			row[j] += v
 			sum += float64(row[j])
 		}
-		normalizeRow(row, sum, weight.Data, bias.Data, eps)
+		normalizeRowInto(row, row, sum, weight.Data, bias.Data, eps)
 	}
 }
 
@@ -88,18 +98,19 @@ func checkLayerNorm(name string, x, weight, bias *tensor.Tensor) {
 	}
 }
 
-// normalizeRow finishes LayerNorm on one row given the sum of its values.
-func normalizeRow(row []float32, sum float64, weight, bias []float32, eps float64) {
-	mean := sum / float64(len(row))
+// normalizeRowInto finishes LayerNorm from src into dst given the sum of src's
+// values. dst and src may alias.
+func normalizeRowInto(dst, src []float32, sum float64, weight, bias []float32, eps float64) {
+	mean := sum / float64(len(src))
 	var variance float64
-	for _, v := range row {
+	for _, v := range src {
 		d := float64(v) - mean
 		variance += d * d
 	}
-	variance /= float64(len(row))
+	variance /= float64(len(src))
 	inv := 1 / math.Sqrt(variance+eps)
-	for j, v := range row {
-		row[j] = float32((float64(v)-mean)*inv)*weight[j] + bias[j]
+	for j, v := range src {
+		dst[j] = float32((float64(v)-mean)*inv)*weight[j] + bias[j]
 	}
 }
 

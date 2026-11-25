@@ -35,6 +35,7 @@ func Check(d *metal.Device, k *metal.Kernels) error {
 	q, qScale := ops.QuantizeInt8(tensor.FromData(wf, n, kd))
 	x := c.floats(m * kd)
 	normIn, normW := c.floats(rows*width), c.floats(dim)
+	lnIn, lnW, lnB := c.floats(rows*dim), c.floats(dim), c.floats(dim)
 	qkv := c.floats(total * width)
 	gateUp, addA, addB := c.floats(rows*2*ff), c.floats(n), c.floats(n)
 	table, tableF := c.bf16s(vocab * dim)
@@ -48,6 +49,7 @@ func Check(d *metal.Device, k *metal.Kernels) error {
 	Q, QScale := c.upload(i8(q)), c.upload(f32(qScale))
 	Y, Rows, YQ, RowsQ := c.buffer(4*m*n), c.buffer(4*m*n), c.buffer(4*m*n), c.buffer(4*m*n)
 	Norm, NormW := c.upload(f32(normIn)), c.upload(f32(normW))
+	LnSrc, LnDst, LnW, LnB := c.upload(f32(lnIn)), c.buffer(4*rows*dim), c.upload(f32(lnW)), c.upload(f32(lnB))
 	Rope, Cos, Sin := c.upload(f32(qkv[prefix*width:])), c.upload(f32(cos)), c.upload(f32(sin))
 	QKV, Ctx := c.upload(f32(qkv)), c.buffer(4*rows*qDim)
 	GateUp, Act := c.upload(f32(gateUp)), c.buffer(4*rows*ff)
@@ -70,6 +72,7 @@ func Check(d *metal.Device, k *metal.Kernels) error {
 		k.Linear(cb, RowsQ.At(4*i*n), n, X.At(4*i*kd), kd, 1, int8)
 	}
 	k.RMSNorm(cb, Norm.At(0), Norm.At(0), NormW.At(0), width, rows, heads, dim, eps)
+	k.LayerNormInto(cb, LnDst.At(0), LnSrc.At(0), LnW.At(0), LnB.At(0), rows, dim, eps)
 	k.RoPE(cb, Rope.At(0), Cos.At(0), Sin.At(0), width, rows, heads+kvHeads, dim)
 	k.KVAppend(cb, kv, QKV.At(4*qDim), QKV.At(4*(qDim+kvDim)), width, total, 0)
 	k.Attend(cb, Ctx.At(0), qDim, QKV.At(4*prefix*width), width, kv, rows, metal.AttendArgs{Heads: heads, Scale: scale, Causal: true, Offset: prefix})
@@ -123,6 +126,13 @@ func Check(d *metal.Device, k *metal.Kernels) error {
 		ops.RMSNorm(tensor.FromData(wantNorm[r*width:r*width+qDim], heads, dim), tensor.FromData(normW, dim), eps)
 	}
 	near(fail, "RMSNorm", floats(Norm, len(wantNorm)), wantNorm, 1e-6, 1e-7)
+
+	wantLN := tensor.New(rows, dim)
+	ops.LayerNormInto(wantLN, tensor.FromData(lnIn, rows, dim), tensor.FromData(lnW, dim), tensor.FromData(lnB, dim), eps)
+	near(fail, "LayerNormInto", floats(LnDst, len(lnIn)), wantLN.Data, 1e-6, 1e-6)
+	if !slices.Equal(floats(LnSrc, len(lnIn)), lnIn) {
+		fail("LayerNormInto modified src")
+	}
 
 	wantRope := slices.Clone(qkv[prefix*width:])
 	rot.Apply(wantRope, width, heads)

@@ -308,23 +308,35 @@ func (k *Kernels) AddRow(c *CommandBuffer, x, row Ref, rows, cols int) {
 // LayerNorm records x = LayerNorm(x + residual)·w + b for each row of x
 // [rows, dim], in place; residual is optional (Buf nil).
 func (k *Kernels) LayerNorm(c *CommandBuffer, x, residual, w, b Ref, rows, dim int, eps float32) {
+	k.layerNorm(c, "LayerNorm", x, x, residual, w, b, rows, dim, eps)
+}
+
+// LayerNormInto records dst = LayerNorm(src)·w + b for each row of src
+// [rows, dim] into dst (which may be src), leaving src unchanged when dst != src.
+func (k *Kernels) LayerNormInto(c *CommandBuffer, dst, src, w, b Ref, rows, dim int, eps float32) {
+	k.layerNorm(c, "LayerNormInto", dst, src, Ref{}, w, b, rows, dim, eps)
+}
+
+func (k *Kernels) layerNorm(c *CommandBuffer, op string, dst, src, residual, w, b Ref, rows, dim int, eps float32) {
 	if rows <= 0 || dim <= 0 {
-		panic(fmt.Sprintf("metal.Kernels.LayerNorm: %d rows of %d", rows, dim))
+		panic(fmt.Sprintf("metal.Kernels.%s: %d rows of %d", op, rows, dim))
 	}
-	need("LayerNorm", "x", x, 4*rows*dim, 4)
-	need("LayerNorm", "w", w, 4*dim, 4)
-	need("LayerNorm", "b", b, 4*dim, 4)
+	need(op, "dst", dst, 4*rows*dim, 4)
+	need(op, "src", src, 4*rows*dim, 4)
+	need(op, "w", w, 4*dim, 4)
+	need(op, "b", b, 4*dim, 4)
 	var add uint32
 	if residual.Buf != nil {
-		need("LayerNorm", "residual", residual, 4*rows*dim, 4)
+		need(op, "residual", residual, 4*rows*dim, 4)
 		add = 1
 	}
 	c.SetPipeline(k.layernorm)
-	c.SetRef(0, x)
-	c.SetRef(1, cmp.Or(residual, x))
-	c.SetRef(2, w)
-	c.SetRef(3, b)
-	SetValue(c, 4, struct {
+	c.SetRef(0, dst)
+	c.SetRef(1, src)
+	c.SetRef(2, cmp.Or(residual, src))
+	c.SetRef(3, w)
+	c.SetRef(4, b)
+	SetValue(c, 5, struct {
 		dim, residual uint32
 		eps           float32
 	}{uint32(dim), add, eps})

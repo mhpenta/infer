@@ -1,0 +1,497 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "options": {},
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+  "ids": [
+   200002,
+   200004,
+   34182,
+   279,
+   154554,
+   150628,
+   25,
+   220,
+   15,
+   13,
+   24,
+   200010,
+   200000,
+   200004,
+   32269,
+   200010
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi there"
+   }
+  ],
+  "options": {
+   "reasoning_effort": "none"
+  },
+  "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi there<|end_message|>",
+  "ids": [
+   200002,
+   200004,
+   1735,
+   149914,
+   172044,
+   13,
+   200010,
+   200002,
+   200004,
+   34182,
+   279,
+   154554,
+   150628,
+   25,
+   220,
+   15,
+   200010,
+   200000,
+   200004,
+   4896,
+   150102,
+   200010
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Simple sum.",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And times 3?"
+   }
+  ],
+  "options": {
+   "reasoning_effort": "low"
+  },
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|><|message_model|><|content_thinking|>Simple sum.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And times 3?<|end_message|>",
+  "ids": [
+   200002,
+   200004,
+   34182,
+   279,
+   154554,
+   150628,
+   25,
+   220,
+   15,
+   13,
+   17,
+   200010,
+   200000,
+   200004,
+   1775,
+   149884,
+   220,
+   17,
+   10,
+   17,
+   30,
+   200010,
+   200001,
+   200008,
+   32153,
+   150811,
+   13,
+   200010,
+   200001,
+   200004,
+   19,
+   200010,
+   200006,
+   200000,
+   200004,
+   1790,
+   150879,
+   220,
+   18,
+   30,
+   200010
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Rate this: été 你好"
+   }
+  ],
+  "options": {
+   "reasoning_effort": 0.5
+  },
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Rate this: été 你好<|end_message|>",
+  "ids": [
+   200002,
+   200004,
+   34182,
+   279,
+   154554,
+   150628,
+   25,
+   220,
+   15,
+   13,
+   20,
+   200010,
+   200000,
+   200004,
+   31320,
+   149928,
+   25,
+   151002,
+   220,
+   11739,
+   23643,
+   200010
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   }
+  ],
+  "options": {
+   "reasoning_effort": 0
+  },
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+  "ids": [
+   200002,
+   200004,
+   34182,
+   279,
+   154554,
+   150628,
+   25,
+   220,
+   15,
+   200010,
+   200000,
+   200004,
+   87,
+   200010
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Only a system message."
+   }
+  ],
+  "options": {
+   "reasoning_effort": "max"
+  },
+  "text": "<|message_system|><|content_text|>Only a system message.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|>",
+  "ids": [
+   200002,
+   200004,
+   74790,
+   149878,
+   150200,
+   151090,
+   13,
+   200010,
+   200002,
+   200004,
+   34182,
+   279,
+   154554,
+   150628,
+   25,
+   220,
+   15,
+   13,
+   68436,
+   200010
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "units": "c",
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "name": "get_weather",
+    "content": "{\"temp\": 18}"
+   },
+   {
+    "role": "assistant",
+    "content": "It is 18°C in Paris."
+   }
+  ],
+  "options": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather in a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "reasoning_effort": "medium"
+  },
+  "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Current weather in a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"units\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"units\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18}<|end_message|><|message_model|><|content_text|>It is 18°C in Paris.<|end_message|><|content_model_end_sampling|>",
+  "ids": [
+   200002,
+   2251,
+   62,
+   76529,
+   200024,
+   58,
+   90,
+   1,
+   70469,
+   1,
+   25,
+   1,
+   36515,
+   154046,
+   149881,
+   149878,
+   152652,
+   13,
+   1,
+   11,
+   1,
+   930,
+   1,
+   25,
+   1,
+   832,
+   62,
+   30847,
+   1,
+   11,
+   1,
+   71968,
+   1,
+   25,
+   90,
+   1,
+   71961,
+   1,
+   25,
+   90,
+   1,
+   2958,
+   1,
+   25,
+   90,
+   1,
+   1008,
+   1,
+   25,
+   1,
+   1485,
+   1,
+   92,
+   11,
+   1,
+   74370,
+   1,
+   25,
+   90,
+   1,
+   32529,
+   1,
+   25,
+   58,
+   1,
+   66,
+   1,
+   11,
+   1,
+   69,
+   1,
+   60,
+   11,
+   1,
+   1008,
+   1,
+   25,
+   1,
+   1485,
+   1,
+   92,
+   92,
+   11,
+   1,
+   69812,
+   1,
+   25,
+   58,
+   1,
+   2958,
+   1,
+   60,
+   11,
+   1,
+   1008,
+   1,
+   25,
+   1,
+   3156,
+   1,
+   92,
+   11,
+   1,
+   1008,
+   1,
+   25,
+   1,
+   36404,
+   1,
+   92,
+   60,
+   200010,
+   200002,
+   200004,
+   34182,
+   279,
+   154554,
+   150628,
+   25,
+   220,
+   15,
+   13,
+   22,
+   200010,
+   200000,
+   200004,
+   35120,
+   149881,
+   152717,
+   30,
+   200010,
+   200001,
+   832,
+   62,
+   30847,
+   200049,
+   90,
+   1,
+   930,
+   1,
+   25,
+   1,
+   832,
+   62,
+   30847,
+   1,
+   11,
+   1,
+   70747,
+   1,
+   25,
+   90,
+   1,
+   2958,
+   1,
+   25,
+   1,
+   3967,
+   1,
+   11,
+   1,
+   74370,
+   1,
+   25,
+   1,
+   66,
+   1,
+   92,
+   92,
+   200010,
+   200006,
+   200003,
+   832,
+   62,
+   30847,
+   200004,
+   90,
+   1,
+   3286,
+   1,
+   25,
+   220,
+   68073,
+   92,
+   200010,
+   200001,
+   200004,
+   1256,
+   149884,
+   220,
+   68073,
+   5140,
+   34,
+   149881,
+   152717,
+   13,
+   200010,
+   200006
+  ]
+ }
+]

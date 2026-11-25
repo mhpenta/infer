@@ -226,7 +226,7 @@ func dtypeSize(dtype string) (int, bool) {
 		return 2, true
 	case "F64", "I64", "U64":
 		return 8, true
-	case "I8", "U8", "BOOL":
+	case "I8", "U8", "BOOL", "F8_E4M3", "F8_E5M2", "F8_E8M0":
 		return 1, true
 	}
 	return 0, false

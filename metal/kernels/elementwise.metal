@@ -81,15 +81,16 @@ struct LayerNormArgs {
     float eps;
 };
 
-// layernorm sets each row of x [rows, dim] to LayerNorm(x (+ residual))·w +
-// b, in place: the sum is stored back, its mean taken, then the mean of
-// squared deviations, as ops.LayerNorm computes them, but in float32. One
-// threadgroup per row.
-kernel void layernorm(device float *x [[buffer(0)]],
-                      device const float *residual [[buffer(1)]],
-                      device const float *w [[buffer(2)]],
-                      device const float *b [[buffer(3)]],
-                      constant LayerNormArgs &a [[buffer(4)]],
+// layernorm sets each row of dst [rows, dim] to LayerNorm(src (+ residual))·w
+// + b, where dst and src may be the same buffer. With residual set, the sum is
+// stored into dst before taking the mean and variance, as ops.AddLayerNorm
+// computes them, in float32. One threadgroup per row.
+kernel void layernorm(device float *dst [[buffer(0)]],
+                      device const float *src [[buffer(1)]],
+                      device const float *residual [[buffer(2)]],
+                      device const float *w [[buffer(3)]],
+                      device const float *b [[buffer(4)]],
+                      constant LayerNormArgs &a [[buffer(5)]],
                       uint tg [[threadgroup_position_in_grid]],
                       uint t [[thread_position_in_threadgroup]],
                       uint nt [[threads_per_threadgroup]],
@@ -97,13 +98,15 @@ kernel void layernorm(device float *x [[buffer(0)]],
                       uint lane [[thread_index_in_simdgroup]],
                       uint nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float scratch[32];
-    device float *row = x + size_t(tg) * a.dim;
+    size_t off = size_t(tg) * a.dim;
+    device float *drow = dst + off;
+    device const float *srow = src + off;
     float sum = 0;
     for (uint j = t; j < a.dim; j += nt) {
-        float v = row[j];
+        float v = srow[j];
         if (a.residual) {
-            v += residual[size_t(tg) * a.dim + j];
-            row[j] = v;
+            v += residual[off + j];
+            drow[j] = v;
         }
         sum += v;
     }
@@ -111,12 +114,14 @@ kernel void layernorm(device float *x [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup); // scratch is reused
     float sq = 0;
     for (uint j = t; j < a.dim; j += nt) {
-        float d = row[j] - mean;
+        float v = a.residual ? drow[j] : srow[j];
+        float d = v - mean;
         sq += d * d;
     }
     float inv = 1 / sqrt(tg_sum(sq, scratch, sg, lane, nsg) / float(a.dim) + a.eps);
     for (uint j = t; j < a.dim; j += nt) {
-        row[j] = (row[j] - mean) * inv * w[j] + b[j];
+        float v = a.residual ? drow[j] : srow[j];
+        drow[j] = (v - mean) * inv * w[j] + b[j];
     }
 }
 

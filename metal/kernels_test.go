@@ -513,6 +513,16 @@ func TestLayerNorm(t *testing.T) {
 		t.Logf("residual %v: largest error / largest value %.2g", withResidual,
 			within(t, "x", read[float32](xb, 0, rows*dim), want.Data, 1e-6, 1e-6))
 	}
+
+	// Out-of-place LayerNormInto must match ops.LayerNormInto and leave src untouched.
+	x, w, b := normals(r, rows*dim, 3), normals(r, dim, 1), normals(r, dim, 1)
+	src, dst, wb, bb := upload(t, d, 0, x), newBuffer(t, d, 4*rows*dim), upload(t, d, 0, w), upload(t, d, 0, b)
+	want := tensor.New(rows, dim)
+	ops.LayerNormInto(want, tensor.FromData(x, rows, dim), tensor.FromData(w, dim), tensor.FromData(b, dim), eps)
+	run(t, d, func(c *CommandBuffer) { k.LayerNormInto(c, dst.At(0), src.At(0), wb.At(0), bb.At(0), rows, dim, eps) })
+	exact(t, "src unchanged", read[float32](src, 0, rows*dim), x)
+	t.Logf("out-of-place: largest error / largest value %.2g",
+		within(t, "dst", read[float32](dst, 0, rows*dim), want.Data, 1e-6, 1e-6))
 }
 
 // TestActivations checks GELU against ops.GELU (the same erf

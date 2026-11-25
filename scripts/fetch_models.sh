@@ -2,6 +2,7 @@
 # Download the model weights the golden tests use into testdata/models, at
 # pinned Hugging Face revisions, and check them against known hashes. Tests
 # that need a model skip when it is missing.
+# An interrupted download resumes from its .part file on the next run.
 #
 #   scripts/fetch_models.sh            # all models (~3.2 GB)
 #   scripts/fetch_models.sh minilm     # just all-MiniLM-L6-v2 (~90 MB)
@@ -12,6 +13,10 @@
 #   scripts/fetch_models.sh qwen3-4b   # Qwen3-4B (~8 GB, bf16; not in "all")
 #   scripts/fetch_models.sh openjev-0.8b # OpenJev's Qwen3.5-0.8B NLI checkpoint (~1.7 GB, bf16; not in "all")
 #   scripts/fetch_models.sh openjev-4b # OpenJev's Qwen3.5-4B NLI checkpoint, v5 (~9.1 GB, bf16; not in "all")
+#   scripts/fetch_models.sh inkling2-mini-tokenizer # Inkling 2 Mini's tokenizer and chat template (~26 MB; not in "all")
+#   scripts/fetch_models.sh inkling2-mini # Inkling 2 Mini (~19.5 GB, NVFP4/MXFP8 experts; not in "all")
+#   scripts/fetch_models.sh yolos-tiny # YOLOS-Tiny object detector (~25 MB, f32; not in "all")
+#   scripts/fetch_models.sh yolos-small-300 # YOLOS-Small-300 object detector (~117 MB, f32; not in "all")
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -27,7 +32,21 @@ fetch() { # name repo[:subfolder] revision "sha256  file" lines...
 		file=${line##* }
 		if [ ! -s "$dir/$file" ]; then
 			echo "fetching $repo $sub$file"
-			curl -fsSL --retry 5 -o "$dir/$file" "https://huggingface.co/$repo/resolve/$rev/$sub$file"
+			# Download into .part, each attempt resuming from its size: a
+			# connection slower than 100 KB/s for a minute is dropped and
+			# the next attempt opens a new one.
+			tries=0
+			until curl -fsSL -C - --speed-limit 100000 --speed-time 60 \
+				-o "$dir/$file.part" "https://huggingface.co/$repo/resolve/$rev/$sub$file"; do
+				tries=$((tries + 1))
+				if [ "$tries" -ge 20 ]; then
+					echo "giving up on $file after $tries attempts; rerun to resume" >&2
+					exit 1
+				fi
+				echo "resuming $file ($(wc -c <"$dir/$file.part" | tr -d ' ') bytes so far)"
+				sleep 5
+			done
+			mv "$dir/$file.part" "$dir/$file"
 		fi
 	done
 	(cd "$dir" && printf '%s\n' "$@" | shasum -a 256 -c -)
@@ -126,4 +145,39 @@ if [ "$want" = openjev-4b ]; then
 		'2b5f6e0691a5ed0c5d0f5f3e49bb26abe2d8efd7c14fda4431cd803c12b78f68  model.safetensors' \
 		'f399b3cd12fa270d51457bb749fb30863521e8359b8a27059c71b6c2f7d6dd6c  tokenizer.json' \
 		'e6f32d049fd16bd0e49604e9173193213fe260984de4629a85d551d85e566020  tokenizer_config.json'
+fi
+
+# Inkling 2 Mini: the tokenizer files alone, or with the weights.
+inkling2_files='a7a349601f0984c4abf999c480ef775d8567d21f5f84b4e8a3e035b44f288dc2  config.json
+a08737c07a65a8fdf69f7cf086576210e5aad4b241437090b26d7b0c4f7905f7  generation_config.json
+7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6  tokenizer.json
+bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636  tokenizer_config.json
+c16f44b3594563d82743ddb0417a2be1bfe3e2000dfad2da4b8f32554593e1a0  special_tokens_map.json
+53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc  chat_template.jinja'
+if [ "$want" = inkling2-mini ]; then
+	inkling2_files="$inkling2_files
+c1631065b7b00787993522dddc66a68b3abee869192977fb3dcb796e63bc5838  model.safetensors.index.json
+65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1  model-00001-of-00001.safetensors"
+fi
+if [ "$want" = inkling2-mini ] || [ "$want" = inkling2-mini-tokenizer ]; then
+	(
+		IFS='
+'
+		# shellcheck disable=SC2086 # one argument per line
+		fetch inkling2-mini thinkingmachines/Inkling-2-Mini ed40e7da625f594fc9c4990f5f66be24873c22d7 $inkling2_files
+	)
+fi
+
+if [ "$want" = yolos-tiny ]; then
+	fetch yolos-tiny hustvl/yolos-tiny 95a90f3c189fbfca3bcfc6d7315b9e84d95dc2de \
+		'a171607bf33c3c85c2cda36e63f681e8b7fd101396b3f0f7a4aa40214020b86e  config.json' \
+		'4309cf0226631c9cd34e6981af842c74f4c9214932741d7fc84b68715c36cf66  preprocessor_config.json' \
+		'5a6a017a20cb522dd347271fa5bd670467e456176aaccd940090e50985ac6e74  model.safetensors'
+fi
+
+if [ "$want" = yolos-small-300 ]; then
+	fetch yolos-small-300 hustvl/yolos-small-300 720d7bcdf9c2028c6c65754012cae4344e9b1f0e \
+		'340c26d18da821b80b7e3a558697f0d39328f99f9f4eabe246ea9851e7f50de5  config.json' \
+		'9f61f8d9ab3b8ead8918198393053a92f8058d34ec92661b4ee1bc5a2365b9f6  preprocessor_config.json' \
+		'ab9cb39a27f9e9c4dc0a9616685304c0b94be0930ddbb695c0a97ca84ec146f9  model.safetensors'
 fi

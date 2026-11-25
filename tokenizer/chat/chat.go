@@ -32,6 +32,10 @@ type Message struct {
 
 	// ToolCalls are the functions an assistant turn calls.
 	ToolCalls []ToolCall
+
+	// Name is a tool message's function, or an assistant's name, for
+	// templates that write it (Inkling 2).
+	Name string
 }
 
 // ToolCall is one function call by the model.
@@ -63,6 +67,11 @@ type Options struct {
 	// transformers' tools argument takes them, such as {"type": "function",
 	// "function": {"name": ..., "description": ..., "parameters": {...}}}.
 	Tools []json.RawMessage
+
+	// ReasoningEffort is Inkling 2's reasoning_effort: "none", "minimal",
+	// "low", "medium", "high" (the default when empty), "xhigh", "max", or a
+	// number from 0 to 0.99. Other templates ignore it.
+	ReasoningEffort string
 }
 
 // Template renders conversations for one model family.
@@ -101,6 +110,8 @@ var templates = map[string]Template{
 	"bc1f78ef8a86b6bdf64a056cf89dd0ac506db4f198ab363d85168e2500ab44dd": MiniCPM5For2B,
 	// Qwen/Qwen3-1.7B (in tokenizer_config.json).
 	"a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8": Qwen3,
+	// thinkingmachines/Inkling-2-Mini.
+	"53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc": Inkling2,
 }
 
 // Load returns the template of the model in dir: chat_template.jinja, or

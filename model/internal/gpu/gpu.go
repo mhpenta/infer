@@ -16,6 +16,7 @@ import (
 	"github.com/mhpenta/infer/metal"
 	"github.com/mhpenta/infer/ops"
 	"github.com/mhpenta/infer/safetensors"
+	"github.com/mhpenta/infer/tensor"
 )
 
 // Loader copies tensors into GPU buffers, remembering the first error, so a
@@ -172,6 +173,9 @@ func (l *Loader) quantized(in, rows int, names []string) (q, scale metal.Ref) {
 			l.Err = err
 			return metal.Ref{}, metal.Ref{}
 		}
+		if len(t.Shape) != 2 {
+			t = tensor.FromData(t.Data, t.Shape[0], in)
+		}
 		qs, ss := ops.QuantizeInt8(t)
 		copy(metal.Slice[int8](qb)[row*in:], qs)
 		copy(metal.Slice[float32](sb)[row:], ss)
@@ -199,6 +203,45 @@ func (l *Loader) vectors(names []string, ns []int) metal.Ref {
 func (l *Loader) Matrix(name string, rows, cols int) metal.Ref {
 	l.file(name, rows, cols)
 	return l.floats([]string{name}, rows*cols)
+}
+
+// Floats loads an arbitrary-rank tensor with the given shape as contiguous
+// float32 values.
+func (l *Loader) Floats(name string, shape ...int) metal.Ref {
+	l.file(name, shape...)
+	total := 1
+	for _, d := range shape {
+		total *= d
+	}
+	return l.floats([]string{name}, total)
+}
+
+// Conv2dAsLinear loads a 4D Conv2d weight [out, inCh, kH, kW] as a 2D
+// [out, inCh*kH*kW] linear layer, with an optional float32 bias [out].
+// Stored bytes are unchanged: flattened [inCh, kH, kW] patches match the
+// row-major Conv2d layout directly.
+func (l *Loader) Conv2dAsLinear(weightName, biasName string, out, inCh, kH, kW int) metal.Weights {
+	in := inCh * kH * kW
+	f := l.file(weightName, out, inCh, kH, kW)
+	if f == nil {
+		return metal.Weights{}
+	}
+	t, ok := stored(f.DType(l.prefix + weightName))
+	if !ok {
+		l.Err = fmt.Errorf("tensor %s is %s; the GPU takes bf16, fp16 or float32 layers", l.prefix+weightName, f.DType(l.prefix+weightName))
+		return metal.Weights{}
+	}
+	w := metal.Weights{Type: t, N: out, K: in}
+	if l.int8 {
+		w.Type = metal.Int8
+		w.W, w.Scale = l.quantized(in, out, []string{weightName})
+	} else {
+		w.W = l.raw(t.Size()*out*in, []string{weightName})
+	}
+	if biasName != "" {
+		w.Bias = l.Vector(biasName, out)
+	}
+	return w
 }
 
 // floats loads tensors, total values in all, back to back as float32.

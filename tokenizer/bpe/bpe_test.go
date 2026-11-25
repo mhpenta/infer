@@ -35,6 +35,8 @@ var goldenModels = []goldenModel{
 	// OpenJev's Qwen3.5 checkpoint: Qwen3.5's tokenizer, whose split keeps
 	// combining marks in words (pretokenize_regex), and no chat goldens.
 	{"INFER_OPENJEV_DIR", "openjev-0.8b", "openjev_0.8b", nil},
+	// Inkling 2 Mini: o200k_base's split, and ignore_merges.
+	{"INFER_INKLING2_DIR", "inkling2-mini", "inkling2_mini", []string{"<|message_user|>", "<|end_message|>", "<|content_model_end_sampling|>"}},
 }
 
 func (g goldenModel) load(t testing.TB) *Tokenizer {

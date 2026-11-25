@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "playground-inkling2",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd /Users/marcpentacoff/Desktop/Projects/infer/playground && exec go run . -model ../testdata/models/inkling2-mini"],
+      "port": 8765
+    }
+  ]
+}

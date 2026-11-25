@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -16,10 +17,21 @@ import (
 // integers are written exactly and other numbers as Python floats (1e-05,
 // 100.0).
 func pythonJSON(raw json.RawMessage) (string, error) {
+	return pythonJSONStyle(raw, jsonStyle{})
+}
+
+// jsonStyle is json.dumps's formatting arguments.
+type jsonStyle struct {
+	compact  bool // separators=(",", ":")
+	sortKeys bool // sort_keys=True: every object's keys in code point order
+}
+
+// pythonJSONStyle is pythonJSON with json.dumps's separators and sort_keys.
+func pythonJSONStyle(raw json.RawMessage, style jsonStyle) (string, error) {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
 	var b strings.Builder
-	if err := writePython(&b, d); err != nil {
+	if err := writePython(&b, d, style); err != nil {
 		return "", fmt.Errorf("chat: %w", err)
 	}
 	if _, err := d.Token(); err != io.EOF {
@@ -29,37 +41,56 @@ func pythonJSON(raw json.RawMessage) (string, error) {
 }
 
 // writePython writes the next value from d.
-func writePython(b *strings.Builder, d *json.Decoder) error {
+func writePython(b *strings.Builder, d *json.Decoder, style jsonStyle) error {
 	tok, err := d.Token()
 	if err != nil {
 		return err
 	}
 	switch v := tok.(type) {
 	case json.Delim:
-		closing, sep := "]", ", "
+		closing, sep, colon := "]", ", ", ": "
+		if style.compact {
+			sep, colon = ",", ":"
+		}
 		if v == '{' {
 			closing = "}"
 		}
-		b.WriteString(v.String())
-		for first := true; d.More(); first = false {
-			if !first {
-				b.WriteString(sep)
-			}
+		// Each entry is written on its own, so that keys can be sorted.
+		var entries []string
+		var keys []string
+		for d.More() {
+			var e strings.Builder
 			if v == '{' {
 				key, err := d.Token()
 				if err != nil {
 					return err
 				}
-				writePythonString(b, key.(string))
-				b.WriteString(": ")
+				keys = append(keys, key.(string))
+				writePythonString(&e, key.(string))
+				e.WriteString(colon)
 			}
-			if err := writePython(b, d); err != nil {
+			if err := writePython(&e, d, style); err != nil {
 				return err
 			}
+			entries = append(entries, e.String())
 		}
 		if _, err := d.Token(); err != nil { // the closing delimiter
 			return err
 		}
+		if v == '{' && style.sortKeys {
+			order := make([]int, len(keys))
+			for i := range order {
+				order[i] = i
+			}
+			sort.SliceStable(order, func(i, j int) bool { return keys[order[i]] < keys[order[j]] })
+			sorted := make([]string, len(entries))
+			for i, k := range order {
+				sorted[i] = entries[k]
+			}
+			entries = sorted
+		}
+		b.WriteString(v.String())
+		b.WriteString(strings.Join(entries, sep))
 		b.WriteString(closing)
 	case string:
 		writePythonString(b, v)

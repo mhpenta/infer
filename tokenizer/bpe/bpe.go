@@ -11,7 +11,8 @@
 //     step before (see splitPatterns), then ByteLevel, which writes each
 //     byte of a piece as one character of GPT-2's byte alphabet.
 //  4. BPE: each piece starts as one token per byte and merges pairs, lowest
-//     rank first, until no merge applies.
+//     rank first, until no merge applies; or, with ignore_merges, a piece
+//     that is itself in the vocabulary is that one token.
 //  5. The post-processor template, for Encode (MiniCPM prepends "<s>";
 //     Qwen's ByteLevel post-processor adds nothing).
 //
@@ -68,6 +69,11 @@ type Tokenizer struct {
 	special []bool         // by id
 	merges  map[uint64]merge
 	byteIDs [256]int32 // the token for each single byte
+
+	// words, with ignore_merges, maps a whole piece (in the byte alphabet)
+	// that is itself in the model's vocabulary to its id, which then
+	// replaces the merges; nil otherwise.
+	words map[string]int
 
 	added     *hf.Added
 	normalize func(string) string // nil without a normalizer
@@ -140,8 +146,6 @@ func Load(path string, config Config) (*Tokenizer, error) {
 		return nil, errors.New("bpe: subword prefixes and suffixes are not supported")
 	case m.ByteFallback:
 		return nil, errors.New("bpe: byte_fallback is not supported")
-	case m.IgnoreMerges:
-		return nil, errors.New("bpe: ignore_merges is not supported")
 	}
 
 	t := &Tokenizer{config: config, vocab: map[string]int{}, merges: map[uint64]merge{}, cache: map[string][]int{}}
@@ -169,6 +173,9 @@ func Load(path string, config Config) (*Tokenizer, error) {
 	for _, a := range tj.AddedTokens {
 		// The added vocabulary takes precedence when mapping ids to tokens.
 		t.vocab[a.Content], t.tokens[a.ID], t.special[a.ID] = a.ID, a.Content, a.Special
+	}
+	if m.IgnoreMerges {
+		t.words = m.Vocab
 	}
 	for b, r := range byteChars {
 		id, ok := m.Vocab[string(r)]
@@ -385,6 +392,15 @@ func (t *Tokenizer) encodePiece(dst []int, piece string) []int {
 	t.mu.Unlock()
 	if ok {
 		return append(dst, cached...)
+	}
+	if t.words != nil {
+		var word strings.Builder
+		for i := range len(piece) {
+			word.WriteRune(byteChars[piece[i]])
+		}
+		if id, ok := t.words[word.String()]; ok {
+			return append(dst, id)
+		}
 	}
 	start := len(dst)
 	ids := make([]int32, len(piece))
